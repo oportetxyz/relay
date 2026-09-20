@@ -155,14 +155,14 @@ auth:
 
 # Passkey association files, served at https://id.oportet.xyz/.well-known/ so
 # that host can become the app's WebAuthn rpId. Each entry lets an app use the
-# passkeys bound to this domain, so list only apps we sign. The Apple team is
-# the one in apps/expo/app.config.ts. The Android fingerprints are the same set
+# passkeys bound to this domain, so list only apps we sign. The Apple team and
+# iOS bundle id are the ones in apps/expo/app.config.ts. The Android fingerprints are the same set
 # onramp.xyz trusts for com.onramp.app, from the monorepo's
 # apps/next/public/.well-known/assetlinks.json. Changes need a relay deploy.
 well_known:
   apple_app_site_association:
     webcredentials:
-      apps: ["Q7767Q7TRJ.com.onramp.app"]
+      apps: ["W86V588NNF.com.onramp.ios"]
   assetlinks:
     - relation:
         - "delegate_permission/common.handle_all_urls"
