@@ -1,4 +1,4 @@
-# Railway deploy config for the Onramp gas-sponsorship relay (testnet + mainnet).
+# Railway deploy config for the Oportet gas-sponsorship relay (testnet + mainnet).
 #
 # Baked into the image and loaded with `--config-only`, so this file is
 # authoritative for everything EXCEPT secrets, which are read from the env at

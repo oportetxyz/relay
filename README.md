@@ -2,6 +2,8 @@
 
 A transparent cross-chain transaction router for EIP-7702 accounts, specifically built for [Porto](https://github.com/ithacaxyz/porto).
 
+> This is Oportet's fork of the [Ithaca relay](https://github.com/ithacaxyz/relay). Ithaca designed and built the relay. The fork carries the changes Oportet's own deployment needs, and [`deploy/railway`](deploy/railway/README.md) describes that deployment.
+
 ## Table of Contents
 
 - [Running](#running)
