@@ -4,8 +4,8 @@ Runbook for adding chain 1 (Ethereum mainnet) and chain 4663 (Robinhood Chain) t
 the relay, bringing them up to the same uniform contract set that Base, Polygon
 and Rise have carried since 2026-07-17.
 
-Two repos are involved. Contracts and funding come from `oportet-account`; the
-relay config and Railway deploy come from `oportet-relay`.
+Two repos are involved. Contracts and funding come from `account`; the
+relay config and Railway deploy come from `relay`.
 
 ## What is already true
 
@@ -57,7 +57,7 @@ boot check.
 ## Watch the Ethereum gas price before step 4
 
 These figures are measured, not estimated. The July deploy left its receipts in
-`oportet-account/broadcast/multi/`, and the same seven contracts at the same salt
+`account/broadcast/multi/`, and the same seven contracts at the same salt
 cost the same gas on Ethereum — the schedule does not differ. Per chain:
 
 | step | gas | value |
@@ -155,7 +155,7 @@ rehearsal is step 10.
 
 ## Step 1 — Environment
 
-From `oportet-account`. Secrets live in Infisical, project `onramp`
+From `account`. Secrets live in Infisical, project `onramp`
 (`034e61e3-e676-46e5-9e83-30d8bed8187f`), env `prod`, path `/relay`. Pull them
 into variables; never echo them.
 
@@ -181,7 +181,7 @@ targeting `[1,4663]` still dies on a missing `RPC_84532`. The two testnet values
 are never dialled by these steps; they only have to exist.
 
 `verify_config.sh` reads a `.env` file rather than the environment, so it needs
-the same eight written to `oportet-account/.env`. That path is gitignored.
+the same eight written to `account/.env`. That path is gitignored.
 Delete it when the deploy is done.
 
 `RPC_URL_ETHEREUM` and `RPC_URL_ROBINHOOD` were added to Infisical `/relay` prod
@@ -232,7 +232,7 @@ half-finished.
 
 ## Step 2 — Add both chains to `deploy/config.toml`
 
-**Already done**, on branch `feat/ethereum-robinhood-chains` in `oportet-account`,
+**Already done**, on branch `feat/ethereum-robinhood-chains` in `account`,
 and the section below is the record of what was written rather than work left to
 do. Read it to check the values, then move to step 3.
 
@@ -682,7 +682,7 @@ unfiltered `--kv` puts every secret on your screen.
 
 ## Step 9 — Uncomment the chain blocks
 
-In `oportet-relay/deploy/railway/relay.yaml`, uncomment the `1:` and `4663:`
+In `relay/deploy/railway/relay.yaml`, uncomment the `1:` and `4663:`
 blocks. They are already written with the right settings and should not need
 editing:
 
@@ -805,7 +805,7 @@ Then confirm independently of the relay's own opinion.
 config actually shipped:
 
 ```bash
-curl -s -X POST https://relay.onramp.xyz \
+curl -s -X POST https://id.oportet.xyz \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"wallet_getCapabilities","params":[]}'
 ```
