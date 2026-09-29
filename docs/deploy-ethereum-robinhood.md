@@ -805,7 +805,7 @@ Then confirm independently of the relay's own opinion.
 config actually shipped:
 
 ```bash
-curl -s -X POST https://relay.onramp.xyz \
+curl -s -X POST https://id.oportet.xyz \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"wallet_getCapabilities","params":[]}'
 ```
