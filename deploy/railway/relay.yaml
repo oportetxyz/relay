@@ -64,6 +64,13 @@ sponsorship:
   # 0.002 ETH/user/day (~$5, a few hundred intents); 0.1 ETH/day breaker (~$250).
   per_user_wei: "2000000000000000"
   circuit_breaker_wei: "100000000000000000"
+  # The dev hatch's one shared identity (auth.dev_api_key, env RELAY_DEV_API_KEY):
+  # dev builds sign in against their own auth server, whose JWTs this relay
+  # cannot verify, so they send the static key instead. One cap for all of them,
+  # in each chain's own unit: 0.002 ETH a day on Base, Rise and Ethereum, and
+  # only 0.002 POL on Polygon, so a dev build pays its own gas there.
+  quota_overrides:
+    dev-local: 2000000000000000
 
 chain_sponsorship:
   # Base mainnet: defaults above. Whitelist = what an ANONYMOUS caller may hit.
@@ -141,7 +148,8 @@ chain_sponsorship:
 # sponsorship and the user pays the fee token. The app attaches the JWT on every
 # relay call (apps/expo/src/lib/porto.ts setRelayAuthToken). Unknown kids
 # refresh the JWKS once, so key rotation needs no restart. The dev hatch
-# (dev_api_key) stays off: dev builds carry real JWTs.
+# is on when RELAY_DEV_API_KEY is set on the service, capped by its
+# quota_overrides entry above.
 # CoinGecko has no coin called "pol": without this remap POL never gets a USD
 # price, every Polygon fee token fails its native conversion, and
 # wallet_getCapabilities lists only the native token on 137.

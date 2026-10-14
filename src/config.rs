@@ -1103,6 +1103,8 @@ mod tests {
         // Base Sepolia (84532) is paused in the yaml; Rise testnet stays open.
         assert!(config.sponsorship.resolve(11155931, &config.chain_sponsorship).sponsor_all);
         assert!(config.auth.is_some());
+        // The boot refuses a set RELAY_DEV_API_KEY unless its subject is capped.
+        assert!(config.sponsorship.quota_overrides.get("dev-local").is_some_and(|&wei| wei > 0));
         // Without this remap POL has no USD price and Polygon lists no fee token
         // but its native one (seen live on 2026-09-05).
         assert_eq!(
