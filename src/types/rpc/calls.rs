@@ -949,6 +949,7 @@ mod tests {
                 ttl: SystemTime::UNIX_EPOCH,
                 multi_chain_root: Some(B256::ZERO),
                 fee_payer_quote: None,
+                key_metadata: Vec::new(),
             }
             .into_signed(signer.sign_hash(&B256::ZERO).await?),
         ));
@@ -999,6 +1000,7 @@ mod tests {
                                     }
                                 })
                                 .collect(),
+                            metadata: None,
                         },
                     }],
                     revoke_keys: vec![RevokeKey { hash: B256::ZERO }],

@@ -2,7 +2,7 @@
 
 use crate::{
     error::RelayError,
-    types::{AssetDeficits, Intent, Intents, Signed, VersionedContracts},
+    types::{AssetDeficits, Intent, Intents, Signed, VersionedContracts, rpc::KeyMetadataEntry},
 };
 use alloy::{
     primitives::{Address, B256, ChainId, Keccak256, Sealable, Signature, U256},
@@ -35,6 +35,9 @@ pub struct Quotes {
     pub multi_chain_root: Option<B256>,
     /// Optional quote for the fee payer.
     pub fee_payer_quote: Option<Box<Quote>>,
+    /// Metadata of the WebAuthn keys the intents authorize, stored once the bundle is accepted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_metadata: Vec<KeyMetadataEntry>,
 }
 
 impl Quotes {
@@ -95,6 +98,12 @@ impl Quotes {
         );
         if let Some(root) = self.multi_chain_root {
             hasher.update(root);
+        }
+        // why: puts the metadata under the relay's signature. Nothing is added when there is
+        // none, so quotes without it hash as before.
+        for entry in &self.key_metadata {
+            hasher.update(entry.key_hash);
+            hasher.update(entry.metadata.digest());
         }
         hasher.finalize()
     }
@@ -281,5 +290,41 @@ mod tests {
         let mut modified = base_quote.clone();
         modified.intent = modified.intent.with_eoa(Address::repeat_byte(1));
         assert_ne!(base_quote.digest(), modified.digest(), "intent must affect digest");
+    }
+
+    #[test]
+    fn quotes_digest_covers_key_metadata_only_when_present() {
+        use crate::types::rpc::{AuthenticatorAttachment, KeyMetadata};
+
+        let quotes = Quotes {
+            quotes: vec![],
+            ttl: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            multi_chain_root: Some(B256::repeat_byte(3)),
+            fee_payer_quote: None,
+            key_metadata: vec![],
+        };
+
+        // The digest as computed before key metadata existed, so quotes signed by an older
+        // relay still verify.
+        let mut legacy = Keccak256::new();
+        legacy.update(1_700_000_000u64.to_be_bytes());
+        legacy.update(B256::repeat_byte(3));
+        assert_eq!(quotes.digest(), legacy.finalize());
+
+        let entry = KeyMetadataEntry {
+            key_hash: B256::repeat_byte(9),
+            metadata: KeyMetadata {
+                credential_id: Some("AbC".to_string()),
+                attachment: Some(AuthenticatorAttachment::CrossPlatform),
+                transports: vec!["usb".to_string()],
+            },
+        };
+        let with = Quotes { key_metadata: vec![entry.clone()], ..quotes.clone() };
+        assert_ne!(quotes.digest(), with.digest());
+
+        let mut swapped = entry;
+        swapped.metadata.attachment = Some(AuthenticatorAttachment::Platform);
+        let swapped = Quotes { key_metadata: vec![swapped], ..quotes };
+        assert_ne!(with.digest(), swapped.digest());
     }
 }

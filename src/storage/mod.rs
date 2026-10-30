@@ -21,7 +21,8 @@ use crate::{
     transactions::{PendingTransaction, PullGasState, RelayTransaction, TransactionStatus, TxId},
     types::{
         AssetDiffs, CreatableAccount, HistoricalPrice, HistoricalPriceKey, SignedCall,
-        SponsorshipUsage, rpc::BundleId,
+        SponsorshipUsage,
+        rpc::{BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
 use alloy::{
@@ -58,6 +59,18 @@ impl StorageApi for RelayStorage {
 
     async fn write_account(&self, account: CreatableAccount) -> api::Result<()> {
         self.inner.write_account(account).await
+    }
+
+    async fn write_key_metadata(
+        &self,
+        account: Address,
+        entries: &[KeyMetadataEntry],
+    ) -> api::Result<()> {
+        self.inner.write_key_metadata(account, entries).await
+    }
+
+    async fn read_key_metadata(&self, account: Address) -> api::Result<HashMap<B256, KeyMetadata>> {
+        self.inner.read_key_metadata(account).await
     }
 
     async fn replace_queued_tx_with_pending(&self, tx: &PendingTransaction) -> api::Result<()> {
@@ -484,7 +497,43 @@ impl StorageApi for RelayStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AssetUid;
+    use crate::types::{AssetUid, rpc::AuthenticatorAttachment};
+
+    #[tokio::test]
+    async fn test_key_metadata_storage() {
+        let storage = get_test_storage().await;
+        let account = Address::random();
+        let other = Address::random();
+        let key_hash = B256::random();
+
+        assert!(storage.read_key_metadata(account).await.unwrap().is_empty());
+
+        let first = KeyMetadata {
+            credential_id: Some("AbC-_09".to_string()),
+            attachment: Some(AuthenticatorAttachment::CrossPlatform),
+            transports: vec!["usb".to_string(), "nfc".to_string()],
+        };
+        storage
+            .write_key_metadata(account, &[KeyMetadataEntry { key_hash, metadata: first.clone() }])
+            .await
+            .unwrap();
+        assert_eq!(storage.read_key_metadata(account).await.unwrap().get(&key_hash), Some(&first));
+        assert!(storage.read_key_metadata(other).await.unwrap().is_empty());
+
+        // A second write for the same key replaces the first.
+        let second = KeyMetadata {
+            credential_id: None,
+            attachment: Some(AuthenticatorAttachment::Platform),
+            transports: vec![],
+        };
+        storage
+            .write_key_metadata(account, &[KeyMetadataEntry { key_hash, metadata: second.clone() }])
+            .await
+            .unwrap();
+        let stored = storage.read_key_metadata(account).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored.get(&key_hash), Some(&second));
+    }
 
     async fn get_test_storage() -> RelayStorage {
         if let Ok(db_url) = std::env::var("DATABASE_URL") {

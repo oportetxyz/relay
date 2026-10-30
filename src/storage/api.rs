@@ -12,7 +12,8 @@ use crate::{
     },
     types::{
         AssetDiffs, CreatableAccount, HistoricalPrice, HistoricalPriceKey, Quote, SignedCall,
-        SponsorshipUsage, rpc::BundleId,
+        SponsorshipUsage,
+        rpc::{BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
 use alloy::{
@@ -102,6 +103,17 @@ pub trait StorageApi: Debug + Send + Sync {
 
     /// Writes [`CreatableAccount`] to storage.
     async fn write_account(&self, account: CreatableAccount) -> Result<()>;
+
+    /// Stores what clients reported about the WebAuthn credentials behind an account's keys,
+    /// replacing an earlier entry for the same key.
+    async fn write_key_metadata(
+        &self,
+        account: Address,
+        entries: &[KeyMetadataEntry],
+    ) -> Result<()>;
+
+    /// Reads the stored credential metadata of an account's keys, by key hash.
+    async fn read_key_metadata(&self, account: Address) -> Result<HashMap<B256, KeyMetadata>>;
 
     /// Replaces previously queued transaction with a pending transaction.
     async fn replace_queued_tx_with_pending(&self, tx: &PendingTransaction) -> Result<()>;

@@ -18,7 +18,8 @@ use crate::{
     },
     types::{
         AssetDiffs, CreatableAccount, HistoricalPrice, HistoricalPriceKey, SignedCall,
-        SponsorshipUsage, rpc::BundleId,
+        SponsorshipUsage,
+        rpc::{BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
 use alloy::{
@@ -98,6 +99,7 @@ struct InMemSponsorshipUsage {
 #[derive(Debug, Default)]
 pub struct InMemoryStorage {
     accounts: DashMap<Address, CreatableAccount>,
+    key_metadata: DashMap<Address, HashMap<B256, KeyMetadata>>,
     pending_transactions: DashMap<TxId, PendingTransaction>,
     statuses: DashMap<TxId, (ChainId, TransactionStatus)>,
     bundles: DashMap<BundleId, Vec<TxId>>,
@@ -143,6 +145,22 @@ impl StorageApi for InMemoryStorage {
     async fn write_account(&self, account: CreatableAccount) -> Result<()> {
         self.accounts.insert(account.address, account);
         Ok(())
+    }
+
+    async fn write_key_metadata(
+        &self,
+        account: Address,
+        entries: &[KeyMetadataEntry],
+    ) -> Result<()> {
+        let mut stored = self.key_metadata.entry(account).or_default();
+        for entry in entries {
+            stored.insert(entry.key_hash, entry.metadata.clone());
+        }
+        Ok(())
+    }
+
+    async fn read_key_metadata(&self, account: Address) -> Result<HashMap<B256, KeyMetadata>> {
+        Ok(self.key_metadata.get(&account).map(|stored| stored.clone()).unwrap_or_default())
     }
 
     async fn replace_queued_tx_with_pending(&self, tx: &PendingTransaction) -> Result<()> {
