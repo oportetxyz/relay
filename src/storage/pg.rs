@@ -28,7 +28,8 @@ use crate::{
     },
     types::{
         AssetDiffs, AssetUid, CreatableAccount, HistoricalPrice, HistoricalPriceKey, SignedCall,
-        SponsorshipUsage, rpc::BundleId,
+        SponsorshipUsage,
+        rpc::{AuthenticatorAttachment, BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
 use alloy::{
@@ -439,6 +440,65 @@ impl StorageApi for PgStorage {
         tx.commit().await.map_err(eyre::Error::from)?;
 
         Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn write_key_metadata(
+        &self,
+        account: Address,
+        entries: &[KeyMetadataEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await.map_err(eyre::Error::from)?;
+        for entry in entries {
+            // Runtime-checked on purpose: a `query!` here would need the offline `.sqlx`
+            // metadata regenerated against a live database.
+            sqlx::query(
+                "insert into credential_metadata (address, key_hash, credential_id, attachment, transports) values ($1, $2, $3, $4, $5) on conflict (address, key_hash) do update set credential_id = excluded.credential_id, attachment = excluded.attachment, transports = excluded.transports",
+            )
+            .bind(account.as_slice())
+            .bind(entry.key_hash.as_slice())
+            .bind(entry.metadata.credential_id.as_deref())
+            .bind(entry.metadata.attachment.map(|attachment| attachment.as_str()))
+            .bind(&entry.metadata.transports)
+            .execute(&mut *tx)
+            .await
+            .map_err(eyre::Error::from)?;
+        }
+        tx.commit().await.map_err(eyre::Error::from)?;
+
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn read_key_metadata(&self, account: Address) -> Result<HashMap<B256, KeyMetadata>> {
+        // Runtime-checked on purpose, as in `write_key_metadata`.
+        let rows = sqlx::query(
+            "select key_hash, credential_id, attachment, transports from credential_metadata where address = $1",
+        )
+        .bind(account.as_slice())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(eyre::Error::from)?;
+
+        rows.into_iter()
+            .map(|row| {
+                let key_hash: Vec<u8> = row.try_get("key_hash").map_err(eyre::Error::from)?;
+                let attachment: Option<String> =
+                    row.try_get("attachment").map_err(eyre::Error::from)?;
+                Ok((
+                    B256::from_slice(&key_hash),
+                    KeyMetadata {
+                        credential_id: row.try_get("credential_id").map_err(eyre::Error::from)?,
+                        attachment: attachment.as_deref().and_then(AuthenticatorAttachment::parse),
+                        transports: row.try_get("transports").map_err(eyre::Error::from)?,
+                    },
+                ))
+            })
+            .collect()
     }
 
     #[instrument(skip_all)]

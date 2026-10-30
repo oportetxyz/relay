@@ -1,6 +1,6 @@
 //! RPC account-related request and response types.
 
-use super::{AuthorizeKey, AuthorizeKeyResponse, SendPreparedCallsResponse};
+use super::{AuthorizeKey, AuthorizeKeyResponse, KeyMetadataEntry, SendPreparedCallsResponse};
 use crate::types::{KeyHash, KeyID, SignedCall};
 use alloy::{
     dyn_abi::TypedData,
@@ -75,6 +75,9 @@ pub struct UpgradeAccountContext {
     pub authorization: Authorization,
     /// Unsigned pre-call to be signed by the EOA root key.
     pub pre_call: SignedCall,
+    /// Metadata of the WebAuthn keys the pre-call authorizes, stored once the upgrade succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_metadata: Vec<KeyMetadataEntry>,
 }
 
 /// Request parameters for `wallet_upgradeAccount`.

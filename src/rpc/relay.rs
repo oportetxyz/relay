@@ -88,7 +88,7 @@ use crate::{
             GetKeysParameters, GetKeysResponse, PrepareCallsParameters, PrepareCallsResponse,
             PrepareCallsResponseCapabilities, PrepareUpgradeAccountParameters,
             SendPreparedCallsParameters, SendPreparedCallsResponse, UpgradeAccountParameters,
-            VerifySignatureParameters, VerifySignatureResponse,
+            VerifySignatureParameters, VerifySignatureResponse, metadata_entries,
         },
     },
 };
@@ -959,16 +959,34 @@ impl Relay {
 
         // Query keys from all requested chains in parallel and bubble errors
         let address = request.address;
-        chains
-            .into_iter()
-            .map(|chain_id| async move {
-                self.get_keys_for_chain(address, chain_id)
-                    .await
-                    .map(|keys| (U64::from(chain_id), keys))
-            })
-            .collect::<FuturesUnordered<_>>()
-            .try_collect()
-            .await
+        let (keys, metadata) = join!(
+            chains
+                .into_iter()
+                .map(|chain_id| async move {
+                    self.get_keys_for_chain(address, chain_id)
+                        .await
+                        .map(|keys| (U64::from(chain_id), keys))
+                })
+                .collect::<FuturesUnordered<_>>()
+                .try_collect::<GetKeysResponse>(),
+            self.inner.storage.read_key_metadata(address),
+        );
+        let mut keys = keys?;
+
+        // why: the metadata is a sign-in hint, so a failed read leaves keys without it instead
+        // of failing the call. It is joined only onto keys the account holds, so a row left by
+        // a bundle that never landed is never read.
+        match metadata {
+            Ok(metadata) if !metadata.is_empty() => {
+                for key in keys.values_mut().flatten() {
+                    key.authorize_key.metadata = metadata.get(&key.hash).cloned();
+                }
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%address, error = %err, "Failed to read key metadata"),
+        }
+
+        Ok(keys)
     }
 
     /// Get keys from an account on a specific chain.
@@ -1025,6 +1043,7 @@ impl Relay {
                 authorize_key: AuthorizeKey {
                     key,
                     permissions: permissioned_keys.remove(&hash).unwrap_or_default(),
+                    metadata: None,
                 },
             })
             .collect())
@@ -1458,9 +1477,12 @@ impl Relay {
 
             let eoa = request.from.ok_or(IntentError::MissingSender)?;
             let identity = IdentityParameters::new(request.key.as_ref(), eoa);
+            let key_metadata =
+                metadata_entries(&request.capabilities.authorize_keys).map_err(RelayError::from)?;
 
-            let (asset_diffs, quotes) =
+            let (asset_diffs, mut quotes) =
                 self.build_quotes(&request, &identity, nonce, delegation_status, user_id).await?;
+            quotes.key_metadata = key_metadata;
 
             // Compute EIP-712 digest for fee_payer quote if present
             let fee_payer_digest = quotes
@@ -2359,6 +2381,7 @@ impl Relay {
                         // Quotes::multichain(quotes, ttl, root)
                         multi_chain_root: None,
                         fee_payer_quote,
+                        key_metadata: Vec::new(),
                     }
                     .with_merkle_payload(self.contracts())?,
                 ));
@@ -2435,6 +2458,7 @@ impl Relay {
                     .expect("should never overflow"),
                 multi_chain_root: None,
                 fee_payer_quote: None,
+                key_metadata: Vec::new(),
             },
         ))
     }
@@ -2981,6 +3005,8 @@ impl RelayApiServer for Relay {
         let provider = self.provider(chain_id)?;
 
         // Generate all calls that will authorize keys and set their permissions
+        let key_metadata =
+            metadata_entries(&request.capabilities.authorize_keys).map_err(RelayError::from)?;
         let calls = self.authorize_into_calls(request.capabilities.authorize_keys.clone())?;
 
         // Random sequence key, with a multichain prefix starting at nonce 0.
@@ -3017,6 +3043,7 @@ impl RelayApiServer for Relay {
                 address: request.address,
                 authorization,
                 pre_call,
+                key_metadata,
             },
             digests,
             typed_data,
@@ -3070,14 +3097,32 @@ impl RelayApiServer for Relay {
                     return Err(AuthError::UnknownAccountQuote.into());
                 }
 
-                self.send_intents(*quotes, capabilities, signature, user_id).await.inspect_err(
-                    |err| {
+                let key_metadata = quotes
+                    .ty()
+                    .quotes
+                    .last()
+                    .map(|quote| (*quote.intent.eoa(), quotes.ty().key_metadata.clone()));
+
+                let id = self
+                    .send_intents(*quotes, capabilities, signature, user_id)
+                    .await
+                    .inspect_err(|err| {
                         error!(
                             %err,
                             "Failed to submit call bundle transaction.",
                         );
-                    },
-                )?
+                    })?;
+
+                // why: the bundle is already submitted, so a failed write only costs the client
+                // its sign-in hint for these keys.
+                if let Some((eoa, entries)) = key_metadata
+                    && !entries.is_empty()
+                    && let Err(err) = self.inner.storage.write_key_metadata(eoa, &entries).await
+                {
+                    error!(%eoa, %err, "Failed to store key metadata");
+                }
+
+                id
             }
             PrepareCallsContext::PreCall(PreCallContext { mut call, chain_id }) => {
                 let eoa = call.eoa;
@@ -3214,8 +3259,29 @@ impl RelayApiServer for Relay {
             .into());
         }
 
+        // why: the context is not signed, so only metadata for keys the signed pre-call
+        // authorizes is kept.
+        let authorized = storage_account
+            .authorized_keys()?
+            .into_iter()
+            .map(|key| key.hash)
+            .collect::<HashSet<_>>();
+        let key_metadata = context
+            .key_metadata
+            .into_iter()
+            .filter(|entry| authorized.contains(&entry.key_hash))
+            .map(|entry| entry.metadata.validate().map(|()| entry))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RelayError::from)?;
+
         // Write to storage to be used on prepareCalls
         self.inner.storage.write_account(storage_account).await?;
+        if !key_metadata.is_empty()
+            && let Err(err) =
+                self.inner.storage.write_key_metadata(context.address, &key_metadata).await
+        {
+            error!(address = %context.address, %err, "Failed to store key metadata");
+        }
 
         Ok(())
     }

@@ -402,7 +402,11 @@ impl KeyWith712Signer {
 
     /// Returns a [`AuthorizeKey`] equivalent.
     pub fn to_authorized(&self) -> AuthorizeKey {
-        AuthorizeKey { key: self.key.clone(), permissions: self.permissions.clone() }
+        AuthorizeKey {
+            key: self.key.clone(),
+            permissions: self.permissions.clone(),
+            metadata: None,
+        }
     }
 
     /// Returns its [`RevokeKey`].

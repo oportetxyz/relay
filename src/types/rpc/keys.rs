@@ -1,6 +1,9 @@
 //! RPC key-related request and response types.
 
-use alloy::primitives::{Address, B256, Bytes, ChainId, U64};
+use alloy::{
+    primitives::{Address, B256, Bytes, ChainId, U64, keccak256},
+    sol_types::SolValue,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -40,6 +43,9 @@ pub struct AuthorizeKey {
     pub key: Key,
     /// The permissions for the key.
     pub permissions: Vec<Permission>,
+    /// What the client knows about the WebAuthn credential behind the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<KeyMetadata>,
 }
 
 impl AuthorizeKey {
@@ -76,6 +82,130 @@ impl AuthorizeKey {
     pub fn into_response(self) -> AuthorizeKeyResponse {
         AuthorizeKeyResponse { hash: self.key.key_hash(), authorize_key: self }
     }
+
+    /// Returns the metadata to store for this key, if it is a WebAuthn key that carries any.
+    ///
+    /// Metadata on other key types is dropped, since only a WebAuthn credential has an
+    /// attachment or transports.
+    pub fn metadata_entry(&self) -> Result<Option<KeyMetadataEntry>, KeysError> {
+        let Some(metadata) = &self.metadata else { return Ok(None) };
+        if !self.key.keyType.is_webauthn() {
+            return Ok(None);
+        }
+        metadata.validate()?;
+        Ok(Some(KeyMetadataEntry { key_hash: self.key.key_hash(), metadata: metadata.clone() }))
+    }
+}
+
+/// Returns the metadata of `keys` to store once the bundle authorizing them is accepted.
+pub fn metadata_entries<'a>(
+    keys: impl IntoIterator<Item = &'a AuthorizeKey>,
+) -> Result<Vec<KeyMetadataEntry>, KeysError> {
+    keys.into_iter().filter_map(|key| key.metadata_entry().transpose()).collect()
+}
+
+/// How a WebAuthn credential is attached to the device that created it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorAttachment {
+    /// Built into the device, synced through the platform's password manager.
+    Platform,
+    /// A roaming authenticator, such as a USB or NFC security key.
+    CrossPlatform,
+}
+
+impl AuthenticatorAttachment {
+    /// The WebAuthn spelling, as stored.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Platform => "platform",
+            Self::CrossPlatform => "cross-platform",
+        }
+    }
+
+    /// Parses the WebAuthn spelling. Unknown values read as `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "platform" => Some(Self::Platform),
+            "cross-platform" => Some(Self::CrossPlatform),
+            _ => None,
+        }
+    }
+}
+
+/// What the client reported about a WebAuthn credential when it was created.
+///
+/// It is a hint for the client's next sign-in (which authenticators to offer), never an input to
+/// signature checks.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyMetadata {
+    /// The credential ID, base64url without padding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    /// The credential's authenticator attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<AuthenticatorAttachment>,
+    /// The transports the authenticator reported, such as `internal`, `hybrid` or `usb`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transports: Vec<String>,
+}
+
+impl KeyMetadata {
+    /// WebAuthn caps a credential ID at 1023 bytes, which is 1364 base64url characters.
+    pub const MAX_CREDENTIAL_ID_LEN: usize = 1364;
+    /// More transports than WebAuthn defines, with room for new ones.
+    pub const MAX_TRANSPORTS: usize = 8;
+    /// The longest transport WebAuthn defines is `smart-card`.
+    pub const MAX_TRANSPORT_LEN: usize = 32;
+
+    /// A digest of the metadata, so a relay-signed quote can cover it.
+    pub fn digest(&self) -> B256 {
+        keccak256(
+            (
+                self.credential_id.clone().unwrap_or_default(),
+                self.attachment
+                    .map(|attachment| attachment.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                self.transports.clone(),
+            )
+                .abi_encode(),
+        )
+    }
+
+    /// Checks sizes and alphabets, so a client can't store arbitrary data under a key.
+    pub fn validate(&self) -> Result<(), KeysError> {
+        let is_base64url = |value: &str| {
+            value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if let Some(id) = &self.credential_id
+            && (id.is_empty() || id.len() > Self::MAX_CREDENTIAL_ID_LEN || !is_base64url(id))
+        {
+            return Err(KeysError::InvalidMetadata("credentialId"));
+        }
+        if self.transports.len() > Self::MAX_TRANSPORTS
+            || self.transports.iter().any(|transport| {
+                transport.is_empty()
+                    || transport.len() > Self::MAX_TRANSPORT_LEN
+                    || !transport.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            })
+        {
+            return Err(KeysError::InvalidMetadata("transports"));
+        }
+        Ok(())
+    }
+}
+
+/// [`KeyMetadata`] for one key, carried from the prepare step to the step that stores it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyMetadataEntry {
+    /// The hash of the key the metadata describes.
+    pub key_hash: KeyHash,
+    /// The metadata.
+    #[serde(flatten)]
+    pub metadata: KeyMetadata,
 }
 
 /// Represents a key authorization response.
@@ -134,8 +264,108 @@ mod tests {
         Call, CallPermission,
         IthacaAccount::SpendPeriod,
         Key, KeyType, U40,
-        rpc::{AuthorizeKey, AuthorizeKeyResponse, Permission, RevokeKey, SpendPermission},
+        rpc::{
+            AuthenticatorAttachment, AuthorizeKey, AuthorizeKeyResponse, KeyMetadata, Permission,
+            RevokeKey, SpendPermission, metadata_entries,
+        },
     };
+
+    fn webauthn_key(metadata: Option<KeyMetadata>) -> AuthorizeKey {
+        AuthorizeKey {
+            key: Key {
+                expiry: U40::from(0),
+                keyType: KeyType::WebAuthnP256,
+                isSuperAdmin: true,
+                publicKey: Bytes::from(vec![7; 64]),
+            },
+            permissions: vec![],
+            metadata,
+        }
+    }
+
+    fn security_key_metadata() -> KeyMetadata {
+        KeyMetadata {
+            credential_id: Some("AbC-_09".to_string()),
+            attachment: Some(AuthenticatorAttachment::CrossPlatform),
+            transports: vec!["usb".to_string(), "nfc".to_string()],
+        }
+    }
+
+    #[test]
+    fn key_metadata_round_trips_and_stays_optional() {
+        let with = webauthn_key(Some(security_key_metadata()));
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            json["metadata"],
+            serde_json::json!({
+                "credentialId": "AbC-_09",
+                "attachment": "cross-platform",
+                "transports": ["usb", "nfc"],
+            })
+        );
+        assert_eq!(serde_json::from_str::<AuthorizeKey>(&json.to_string()).unwrap(), with);
+
+        // Keys from clients that send no metadata serialize exactly as before.
+        let without = webauthn_key(None);
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(json.get("metadata").is_none());
+        assert_eq!(serde_json::from_str::<AuthorizeKey>(&json.to_string()).unwrap(), without);
+    }
+
+    #[test]
+    fn key_metadata_validation() {
+        assert!(security_key_metadata().validate().is_ok());
+        assert!(KeyMetadata::default().validate().is_ok());
+
+        let bad = [
+            KeyMetadata { credential_id: Some(String::new()), ..Default::default() },
+            KeyMetadata { credential_id: Some("a+b/c=".to_string()), ..Default::default() },
+            KeyMetadata {
+                credential_id: Some("a".repeat(KeyMetadata::MAX_CREDENTIAL_ID_LEN + 1)),
+                ..Default::default()
+            },
+            KeyMetadata { transports: vec!["USB".to_string()], ..Default::default() },
+            KeyMetadata { transports: vec![String::new()], ..Default::default() },
+            KeyMetadata {
+                transports: vec!["usb".to_string(); KeyMetadata::MAX_TRANSPORTS + 1],
+                ..Default::default()
+            },
+        ];
+        for metadata in bad {
+            assert!(metadata.validate().is_err(), "{metadata:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_entries_keep_only_webauthn_keys() {
+        let mut p256 = webauthn_key(Some(security_key_metadata()));
+        p256.key.keyType = KeyType::P256;
+        let webauthn = webauthn_key(Some(security_key_metadata()));
+
+        let entries = metadata_entries([&p256, &webauthn_key(None), &webauthn]).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key_hash, webauthn.key.key_hash());
+        assert_eq!(entries[0].metadata, security_key_metadata());
+
+        let invalid = webauthn_key(Some(KeyMetadata {
+            transports: vec!["usb usb".to_string()],
+            ..Default::default()
+        }));
+        assert!(metadata_entries([&invalid]).is_err());
+    }
+
+    #[test]
+    fn key_metadata_digest_covers_every_field() {
+        let base = security_key_metadata();
+        let changed = [
+            KeyMetadata { credential_id: None, ..base.clone() },
+            KeyMetadata { attachment: Some(AuthenticatorAttachment::Platform), ..base.clone() },
+            KeyMetadata { transports: vec!["usb".to_string()], ..base.clone() },
+        ];
+        for other in changed {
+            assert_ne!(base.digest(), other.digest(), "{other:?}");
+        }
+    }
 
     #[test]
     fn test_authorize_into_calls() {
@@ -159,6 +389,7 @@ mod tests {
                     token: Address::ZERO,
                 }),
             ],
+            metadata: None,
         };
 
         let (authorize, calls) = key.clone().into_calls().unwrap();
@@ -207,6 +438,7 @@ mod tests {
                     token: Address::ZERO,
                 }),
             ],
+            metadata: None,
         };
 
         assert_eq!(
@@ -233,6 +465,7 @@ mod tests {
                     to: Address::ZERO,
                     selector: fixed_bytes!("0xa9059cbb"),
                 })],
+                metadata: None,
             },
         };
 
@@ -267,6 +500,7 @@ mod tests {
                         to: Address::ZERO,
                         selector: fixed_bytes!("0xa9059cbb"),
                     })],
+                    metadata: None,
                 },
             }
         );

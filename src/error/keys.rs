@@ -20,6 +20,9 @@ pub enum KeysError {
     /// Unknown key hash.
     #[error("key hash {0} is unknown")]
     UnknownKeyHash(KeyHash),
+    /// A key's metadata field is malformed or too long.
+    #[error("invalid key metadata: {0}")]
+    InvalidMetadata(&'static str),
 }
 
 impl From<KeysError> for jsonrpsee::types::error::ErrorObject<'static> {
@@ -29,7 +32,8 @@ impl From<KeysError> for jsonrpsee::types::error::ErrorObject<'static> {
             | KeysError::PrecallConflictingKeys
             | KeysError::OnlyAdminKeyAllowed
             | KeysError::InvalidSignature
-            | KeysError::UnknownKeyHash { .. } => invalid_params(err.to_string()),
+            | KeysError::UnknownKeyHash { .. }
+            | KeysError::InvalidMetadata(_) => invalid_params(err.to_string()),
         }
     }
 }
