@@ -2,10 +2,13 @@
 
 use crate::{
     error::{QuoteError, RelayError},
-    types::{AssetDeficits, Intent, Intents, Signed, VersionedContracts, rpc::KeyMetadataEntry},
+    types::{
+        AssetDeficits, Intent, Intents, QuotaSubject, Signed, VersionedContracts,
+        rpc::KeyMetadataEntry,
+    },
 };
 use alloy::{
-    primitives::{Address, B256, ChainId, Keccak256, Sealable, Signature, U256},
+    primitives::{Address, B256, ChainId, Keccak256, Sealable, Signature, U256, keccak256},
     providers::utils::Eip1559Estimation,
     rpc::types::SignedAuthorization,
 };
@@ -20,6 +23,10 @@ pub type SignedQuotes = Signed<Quotes>;
 /// why: the other optional fields are hashed in 32 byte words, so a bare digest here could be
 /// sent back as `multi_chain_root` and hash the same. This tag is not a multiple of 32 bytes.
 const FEE_PAYER_QUOTE_TAG: &[u8] = b"relay.quotes.feePayerQuote";
+
+/// Separates the quota subject from the rest of [`Quotes::digest`], as
+/// [`FEE_PAYER_QUOTE_TAG`] does. The subject is hashed so what follows the tag has a fixed length.
+const QUOTA_SUBJECT_TAG: &[u8] = b"relay.quotes.quotaSubject";
 
 /// A set of quotes from the relay with a set of intents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +51,10 @@ pub struct Quotes {
     /// Metadata of the WebAuthn keys the intents authorize, stored once the bundle is accepted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_metadata: Vec<KeyMetadataEntry>,
+    /// Who sponsorship of these quotes counts against, decided at prepare. `None` when the
+    /// quotes are not sponsored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_subject: Option<QuotaSubject>,
 }
 
 impl Quotes {
@@ -116,6 +127,12 @@ impl Quotes {
         for entry in &self.key_metadata {
             hasher.update(entry.key_hash);
             hasher.update(entry.metadata.digest());
+        }
+        // why: the subject decides whose quota pays, so the client cannot be free to change it.
+        // Nothing is added when there is none, so unsponsored quotes hash as before.
+        if let Some(subject) = &self.quota_subject {
+            hasher.update(QUOTA_SUBJECT_TAG);
+            hasher.update(keccak256(subject.as_str()));
         }
         hasher.finalize()
     }
@@ -361,6 +378,7 @@ mod tests {
             multi_chain_root,
             fee_payer_quote: None,
             key_metadata: vec![],
+            quota_subject: None,
         }
     }
 
@@ -441,6 +459,31 @@ mod tests {
     }
 
     #[test]
+    fn quota_subject_is_bound_to_the_signature() {
+        let quotes =
+            Quotes { quota_subject: Some(QuotaSubject::new("sub-7f3a")), ..fixed_quotes(0, None) };
+        assert_ne!(quotes.digest(), fixed_quotes(0, None).digest());
+        assert!(!format!("{quotes:?}").contains("sub-7f3a"), "the subject stays out of logs");
+
+        let (signer, wire) = sign(quotes);
+        assert_eq!(wire["quotaSubject"], "sub-7f3a");
+        assert_eq!(recover(wire.clone()), signer, "the quote as signed verifies");
+
+        let mut stripped = wire.clone();
+        stripped.as_object_mut().unwrap().remove("quotaSubject");
+        assert_ne!(recover(stripped), signer, "stripped");
+
+        let mut swapped = wire.clone();
+        swapped["quotaSubject"] = "someone-else".into();
+        assert_ne!(recover(swapped), signer, "swapped");
+
+        let mut moved = wire;
+        moved["quotaSubject"] = serde_json::Value::Null;
+        moved["multiChainRoot"] = keccak256("sub-7f3a").to_string().into();
+        assert_ne!(recover(moved), signer, "moved into the root");
+    }
+
+    #[test]
     fn fund_transfers_are_refused_on_a_fee_payer_quote() {
         let mut quote = fixed_quote(300);
         assert!(QuoteRole::FeePayer.check(&quote).is_ok(), "no transfers");
@@ -464,6 +507,7 @@ mod tests {
             multi_chain_root: Some(B256::repeat_byte(3)),
             fee_payer_quote: None,
             key_metadata: vec![],
+            quota_subject: None,
         };
 
         // The digest as computed before key metadata existed, so quotes signed by an older

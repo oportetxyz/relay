@@ -11,14 +11,17 @@ use alloy::{
     providers::{Provider, ext::AnvilApi},
     rpc::types::TransactionReceipt,
 };
+use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use relay::{
+    config::AuthConfig,
     rpc::RelayApiClient,
     signers::Eip712PayLoadSigner,
     storage::StorageApi,
     types::{
         Call, KeyType, KeyWith712Signer,
         OrchestratorContract::IntentExecuted,
-        SponsorshipConfig, SponsorshipUsage,
+        QuotaKey, SponsorshipConfig, SponsorshipUsage,
         rpc::{
             BundleId, Meta, PrepareCallsCapabilities, PrepareCallsParameters, PrepareCallsResponse,
         },
@@ -103,13 +106,14 @@ pub(super) async fn latest_transaction(
     Ok((receipt, spent))
 }
 
+/// The ledger's total for `subject`.
+async fn booked_for(env: &Environment, subject: &str) -> eyre::Result<U256> {
+    Ok(env.relay_handle.storage.sponsored_wei_in_window(subject, env.chain_id(), 24).await?)
+}
+
 /// The ledger's total for the test account.
 pub(super) async fn booked(env: &Environment) -> eyre::Result<U256> {
-    Ok(env
-        .relay_handle
-        .storage
-        .sponsored_wei_in_window(&env.eoa.address().to_string(), env.chain_id(), 24)
-        .await?)
+    booked_for(env, &env.eoa.address().to_string()).await
 }
 
 /// Fails unless the ledger holds exactly `expected`. A final status means the booking is done.
@@ -120,8 +124,16 @@ pub(super) async fn assert_booked(env: &Environment, expected: U256) -> eyre::Re
 
 /// Prepares the test account's intent.
 async fn prepare(env: &Environment, key: &KeyWith712Signer) -> eyre::Result<PrepareCallsResponse> {
-    Ok(env
-        .relay_endpoint
+    prepare_through(&env.relay_endpoint, env, key).await
+}
+
+/// Prepares the test account's intent through `client`.
+async fn prepare_through(
+    client: &HttpClient,
+    env: &Environment,
+    key: &KeyWith712Signer,
+) -> eyre::Result<PrepareCallsResponse> {
+    Ok(client
         .prepare_calls(PrepareCallsParameters {
             from: Some(env.eoa.address()),
             calls: vec![Call::transfer(env.erc20, Address::random(), U256::from(1))],
@@ -145,8 +157,17 @@ fn charged(response: &PrepareCallsResponse) -> U256 {
 /// Sends an intent, makes `outcome` true on chain, and returns what the relay paid.
 async fn land(env: &Environment, key: &KeyWith712Signer, outcome: Outcome) -> eyre::Result<U256> {
     mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
-
     let response = prepare(env, key).await?;
+    land_prepared(env, key, response, outcome).await
+}
+
+/// Signs and sends `response`, makes `outcome` true on chain, and returns what the relay paid.
+async fn land_prepared(
+    env: &Environment,
+    key: &KeyWith712Signer,
+    response: PrepareCallsResponse,
+    outcome: Outcome,
+) -> eyre::Result<U256> {
     let signature = key.sign_payload_hash(response.digest).await?;
 
     env.disable_mining().await;
@@ -400,4 +421,46 @@ async fn the_ledger_counts_a_repeated_hash_once() -> eyre::Result<()> {
     storage.record_sponsorship_usage(usage).await?;
 
     assert_booked(&env, spent).await
+}
+
+/// The subject the quote was prepared for is the one booked, so sending with no token changes
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn books_the_subject_bound_at_prepare() -> eyre::Result<()> {
+    const DEV_KEY: &str = "e2e-dev-key";
+    const SUBJECT: &str = "dev-local";
+
+    let mut env = Environment::setup().await?;
+    let sponsorship = SponsorshipConfig {
+        sponsored_chains: [env.chain_id()].into(),
+        whitelisted_contracts: std::iter::once(env.erc20).collect(),
+        per_user_wei: U256::from(u128::MAX),
+        circuit_breaker_wei: U256::MAX,
+        window_hours: 24,
+        quota_key: QuotaKey::User,
+        quota_overrides: [(SUBJECT.to_string(), u128::MAX)].into(),
+        ..Default::default()
+    };
+    env.config.auth = Some(AuthConfig {
+        jwks_url: "http://127.0.0.1:1/jwks".to_string(),
+        dev_api_key: Some(DEV_KEY.to_string()),
+        dev_subject: None,
+    });
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let with_token = HttpClientBuilder::default()
+        .set_headers(HeaderMap::from_iter([(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {DEV_KEY}"))?,
+        )]))
+        .build(env.relay_handle.http_url())?;
+    let response = prepare_through(&with_token, &env, &key).await?;
+    assert!(charged(&response).is_zero());
+
+    let before = booked_for(&env, SUBJECT).await?;
+    let spent = land_prepared(&env, &key, response, Outcome::Succeeds).await?;
+
+    assert_eq!(booked_for(&env, SUBJECT).await?, before + spent);
+    assert_booked(&env, U256::ZERO).await
 }

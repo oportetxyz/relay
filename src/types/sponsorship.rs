@@ -5,7 +5,7 @@
 //! on-chain gas. Sponsored spend is recorded post-receipt into `sponsorship_usage`
 //! and drives a global circuit breaker + a per-subject rolling quota.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use alloy::primitives::{
     Address, ChainId, FixedBytes, U256,
@@ -212,6 +212,31 @@ pub struct SponsorshipBreakerStatus {
     pub spent_wei: U256,
     /// `spent_wei >= cap_wei`: nobody is sponsored until spend ages out.
     pub tripped: bool,
+}
+
+/// The identity a sponsored transaction counts against: an EOA, or a user's JWT `sub`.
+///
+/// `Debug` hides the value, since this type sits inside quotes and transactions that get logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QuotaSubject(String);
+
+impl QuotaSubject {
+    /// Wraps a subject.
+    pub fn new(subject: impl Into<String>) -> Self {
+        Self(subject.into())
+    }
+
+    /// The subject itself.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for QuotaSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("QuotaSubject(..)")
+    }
 }
 
 /// One sponsored transaction, recorded post-receipt.

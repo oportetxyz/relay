@@ -1,6 +1,6 @@
 use crate::{
     interop::EscrowDetails,
-    types::{IEscrow, Quote, SignedCalls, rpc::CallStatusCode},
+    types::{IEscrow, QuotaSubject, Quote, SignedCalls, rpc::CallStatusCode},
 };
 use alloy::{
     consensus::{Transaction, TxEip1559, TxEip7702, TxEnvelope, TypedTransaction},
@@ -94,11 +94,11 @@ pub struct RelayTransaction {
     /// Time at which we've received this transaction.
     pub received_at: DateTime<Utc>,
     /// Gas-sponsorship quota subject (address or verified user id) this tx is
-    /// recorded against, resolved at send time per the chain's policy. `None`
+    /// recorded against, bound to the quote at prepare per the chain's policy. `None`
     /// for non-sponsored txs (and legacy rows). Read by the confirmed-metrics
     /// recorder so user-mode quota keys the same subject the decision counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_subject: Option<String>,
+    pub quota_subject: Option<QuotaSubject>,
     /// Account an internal transaction is sponsored for. An intent carries its own, see
     /// [`RelayTransaction::sponsored_account`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,7 +147,7 @@ impl RelayTransaction {
     }
 
     /// Set the gas-sponsorship quota subject this tx is recorded against.
-    pub fn with_quota_subject(mut self, quota_subject: Option<String>) -> Self {
+    pub fn with_quota_subject(mut self, quota_subject: Option<QuotaSubject>) -> Self {
         self.quota_subject = quota_subject;
         self
     }
