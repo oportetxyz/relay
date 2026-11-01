@@ -1,6 +1,6 @@
 use crate::{
     interop::EscrowDetails,
-    types::{IEscrow, Quote, SignedCalls, rpc::CallStatusCode},
+    types::{IEscrow, QuotaSubject, Quote, SignedCalls, rpc::CallStatusCode},
 };
 use alloy::{
     consensus::{Transaction, TxEip1559, TxEip7702, TxEnvelope, TypedTransaction},
@@ -94,11 +94,15 @@ pub struct RelayTransaction {
     /// Time at which we've received this transaction.
     pub received_at: DateTime<Utc>,
     /// Gas-sponsorship quota subject (address or verified user id) this tx is
-    /// recorded against, resolved at send time per the chain's policy. `None`
+    /// recorded against, bound to the quote at prepare per the chain's policy. `None`
     /// for non-sponsored txs (and legacy rows). Read by the confirmed-metrics
     /// recorder so user-mode quota keys the same subject the decision counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_subject: Option<String>,
+    pub quota_subject: Option<QuotaSubject>,
+    /// Account an internal transaction is sponsored for. An intent carries its own, see
+    /// [`RelayTransaction::sponsored_account`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsored_for: Option<Address>,
 }
 
 impl RelayTransaction {
@@ -118,11 +122,32 @@ impl RelayTransaction {
             trace_context: Context::current(),
             received_at: Utc::now(),
             quota_subject: None,
+            sponsored_for: None,
         }
     }
 
+    /// The account whose sponsorship pays for this transaction, if any.
+    ///
+    /// A zero-payment intent means the relay funder covered the on-chain gas (see rpc::relay
+    /// build_quotes). ponytail: zero-payment also holds for an external fee_payer, which we don't
+    /// expose to clients, so it currently marks our own sponsorship.
+    pub fn sponsored_account(&self) -> Option<Address> {
+        match &self.kind {
+            RelayTransactionKind::Intent { quote, .. } => {
+                quote.intent.total_payment_max_amount().is_zero().then(|| *quote.intent.eoa())
+            }
+            RelayTransactionKind::Internal { .. } => self.sponsored_for,
+        }
+    }
+
+    /// Mark an internal transaction as sponsored for `account`.
+    pub fn with_sponsored_for(mut self, account: Address) -> Self {
+        self.sponsored_for = Some(account);
+        self
+    }
+
     /// Set the gas-sponsorship quota subject this tx is recorded against.
-    pub fn with_quota_subject(mut self, quota_subject: Option<String>) -> Self {
+    pub fn with_quota_subject(mut self, quota_subject: Option<QuotaSubject>) -> Self {
         self.quota_subject = quota_subject;
         self
     }
@@ -167,6 +192,7 @@ impl RelayTransaction {
             trace_context: Context::current(),
             received_at: Utc::now(),
             quota_subject: None,
+            sponsored_for: None,
         }
     }
 

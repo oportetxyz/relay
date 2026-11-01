@@ -72,6 +72,9 @@ pub struct SignerMetrics {
     pub nonce: Counter,
     /// Number of transaction simulation retry attempts.
     pub simulation_retries: Counter,
+    /// Confirmed transactions whose outcome could not be stored after every retry. Each one
+    /// stays pending until the relay restarts.
+    pub confirmation_write_failures: Counter,
 }
 
 impl SignerMetrics {
@@ -91,6 +94,7 @@ impl SignerMetrics {
             native_spent: gauge!("signer.native_spent", "address" => address.to_string(), "chain_id" => chain_id.to_string()),
             nonce: counter!("signer.nonce", "address" => address.to_string(), "chain_id" => chain_id.to_string()),
             simulation_retries: counter!("signer.simulation_retries", "address" => address.to_string(), "chain_id" => chain_id.to_string()),
+            confirmation_write_failures: counter!("signer.confirmation_write_failures", "address" => address.to_string(), "chain_id" => chain_id.to_string()),
         }
     }
 }

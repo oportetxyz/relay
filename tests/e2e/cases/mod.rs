@@ -26,6 +26,7 @@ mod signature;
 mod simple;
 mod simple_settlement;
 mod simulation;
+mod sponsorship;
 mod transactions;
 mod undeployed_token;
 mod upgrade;

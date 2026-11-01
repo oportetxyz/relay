@@ -14,8 +14,8 @@ use crate::{
     error::StorageError,
     storage::{RelayStorage, StorageApi},
     types::{
-        Call, ChainSponsorshipConfig, QuotaKey, SponsorshipBreakerStatus, SponsorshipConfig,
-        SponsorshipQuotaResponse,
+        Call, ChainSponsorshipConfig, QuotaKey, QuotaSubject, SponsorshipBreakerStatus,
+        SponsorshipConfig, SponsorshipQuotaResponse,
     },
 };
 
@@ -57,8 +57,8 @@ impl SponsorshipEvaluator {
     }
 
     /// The subject a sponsored tx on `chain_id` should be recorded against,
-    /// resolved through that chain's policy. Used at send time so the usage
-    /// ledger keys the SAME subject the decision counted (address or verified
+    /// resolved through that chain's policy. Used where the decision is made so
+    /// the usage ledger keys the SAME subject it counted (address or verified
     /// user). `None` under `quota_key = user` with no verified user — in which
     /// case the tx would not have been sponsored, so nothing is recorded.
     pub fn resolve_quota_subject(
@@ -66,8 +66,8 @@ impl SponsorshipEvaluator {
         eoa: Address,
         user_id: Option<&str>,
         chain_id: ChainId,
-    ) -> Option<String> {
-        Self::quota_subject(&self.config_for(chain_id), eoa, user_id)
+    ) -> Option<QuotaSubject> {
+        Self::quota_subject(&self.config_for(chain_id), eoa, user_id).map(QuotaSubject::new)
     }
 
     /// Target guard: whether every call lands on our sponsored contract set.
@@ -308,6 +308,17 @@ mod tests {
 
     // (c) the global circuit breaker trips once total sponsored spend across ALL
     // subjects reaches the ceiling, even for a subject with fresh personal quota.
+    /// A booking replayed after a restart counts once, as the Postgres unique key makes it.
+    #[tokio::test]
+    async fn a_repeated_booking_counts_once() {
+        let storage = RelayStorage::in_memory();
+        seed(&storage, "subject", CHAIN, U256::from(5)).await;
+        seed(&storage, "subject", CHAIN, U256::from(5)).await;
+
+        let total = storage.sponsored_wei_in_window("subject", CHAIN, 24).await.unwrap();
+        assert_eq!(total, U256::from(5));
+    }
+
     #[tokio::test]
     async fn global_breaker_trips() {
         let (eval, storage) = evaluator(user_mode_cfg());
