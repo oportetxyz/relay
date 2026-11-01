@@ -914,8 +914,8 @@ impl Signer {
     /// per-subject quota and the global circuit breaker.
     ///
     /// The relay paid for the transaction whatever it did on chain, so the outcome plays no part
-    /// here. The quota subject was resolved at send time per the chain's policy (address or
-    /// verified user); fall back to the address for legacy txs with no stored subject.
+    /// here. The quota subject was bound to the quote at prepare per the chain's policy
+    /// (address or verified user); fall back to the address for legacy txs with no stored subject.
     async fn book_sponsored_spend(
         &self,
         tx: &RelayTransaction,
@@ -930,7 +930,10 @@ impl Signer {
         self.storage
             .record_sponsorship_usage(SponsorshipUsage {
                 user_address: eoa,
-                quota_subject: tx.quota_subject.clone().unwrap_or_else(|| eoa.to_string()),
+                quota_subject: tx
+                    .quota_subject
+                    .as_ref()
+                    .map_or_else(|| eoa.to_string(), |subject| subject.as_str().to_owned()),
                 chain_id: self.chain_id,
                 tx_hash: receipt.transaction_hash.to_string(),
                 gas_used,
