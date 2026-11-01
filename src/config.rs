@@ -40,6 +40,24 @@ use std::{
 };
 use tracing::{info, warn};
 
+/// Which addresses a client may name as `meta.feePayer`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FeePayerConfig {
+    /// Accept any address. For tests only.
+    #[serde(default)]
+    pub allow_any: bool,
+    /// Addresses accepted as fee payer. Empty = none (fail-closed).
+    #[serde(default)]
+    pub allowed: BTreeSet<Address>,
+}
+
+impl FeePayerConfig {
+    /// Whether a client may name `fee_payer`.
+    pub fn permits(&self, fee_payer: Address) -> bool {
+        self.allow_any || self.allowed.contains(&fee_payer)
+    }
+}
+
 // todo(onbjerg): We should consider merging the contract addresses into a `ContractConfig` struct,
 // which would 1) make the config more readable and 2) simplify things like fetching
 // [`VersionedContracts`].
@@ -106,6 +124,9 @@ pub struct RelayConfig {
     /// Per-chain gas-sponsorship overrides, keyed by chain id.
     #[serde(default)]
     pub chain_sponsorship: std::collections::HashMap<ChainId, ChainSponsorshipConfig>,
+    /// Which addresses a client may name as `meta.feePayer`. Default: none.
+    #[serde(default)]
+    pub fee_payers: FeePayerConfig,
     /// Optional Better Auth JWT verification. When set, the relay verifies
     /// `Authorization: Bearer` tokens against the app's JWKS so sponsorship
     /// quota can be keyed by user id. Absent = address-mode quota only.
@@ -356,6 +377,12 @@ impl RelayConfig {
     /// Sets the rebalance service configuration.
     pub fn with_rebalance_service_config(mut self, config: Option<RebalanceServiceConfig>) -> Self {
         self.rebalance_service = config;
+        self
+    }
+
+    /// Sets which addresses a client may name as fee payer.
+    pub fn with_fee_payers(mut self, fee_payers: FeePayerConfig) -> Self {
+        self.fee_payers = fee_payers;
         self
     }
 
@@ -1086,6 +1113,20 @@ mod tests {
         assert_eq!(from_yaml.transactions, config.transactions);
     }
 
+    #[test]
+    fn fee_payers_are_refused_unless_listed() {
+        let listed = Address::repeat_byte(1);
+        let other = Address::repeat_byte(2);
+
+        assert!(!FeePayerConfig::default().permits(listed));
+
+        let config = FeePayerConfig { allowed: [listed].into(), ..Default::default() };
+        assert!(config.permits(listed));
+        assert!(!config.permits(other));
+
+        assert!(FeePayerConfig { allow_any: true, ..Default::default() }.permits(other));
+    }
+
     // The Railway deploy config is what production boots on; a typo there
     // only shows up as a failed deploy otherwise.
     #[test]
@@ -1093,6 +1134,8 @@ mod tests {
         let s = include_str!("../deploy/railway/relay.yaml");
         let config = serde_yaml::from_str::<RelayConfig>(s).unwrap();
         assert!(!config.sponsorship.sponsor_all, "mainnet relay must not sponsor_all");
+        assert!(!config.fee_payers.allow_any, "mainnet relay must not allow any fee payer");
+        assert!(!config.fee_payers.permits(Address::repeat_byte(1)));
         for id in [8453u64, 137, 4153] {
             assert!(config.sponsorship.sponsored_chains.contains(&id), "chain {id} not sponsored");
             let cfg = config.sponsorship.resolve(id, &config.chain_sponsorship);

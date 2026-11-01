@@ -6,6 +6,7 @@ use crate::e2e::{
     environment::{Environment, mint_erc20s},
     eoa::{MockAccount, MockAccountBuilder},
     layerzero::setup::LayerZeroEnvironment,
+    send_prepared_calls,
 };
 use alloy::{
     primitives::{Address, B256, Bytes, ChainId, U64, U256},
@@ -19,8 +20,8 @@ use relay::{
     types::{
         AssetDiffResponse, Call, DiffDirection, IERC20, KeyType, KeyWith712Signer, Signature,
         rpc::{
-            Meta, PrepareCallsCapabilities, PrepareCallsParameters, PrepareCallsResponse,
-            SendPreparedCallsCapabilities, SendPreparedCallsParameters,
+            Meta, PrepareCallsCapabilities, PrepareCallsContext, PrepareCallsParameters,
+            PrepareCallsResponse, SendPreparedCallsCapabilities, SendPreparedCallsParameters,
         },
     },
 };
@@ -971,5 +972,104 @@ fn assert_multichain_user_with_cross_chain_fee_payer_snapshot(
         ".typedData.message.paymentToken" => reduction_from_str::<Address>("paymentToken"),
         ".typedData.message.settler" => reduction_from_str::<Address>("settler"),
     });
+    Ok(())
+}
+
+/// A signed quote edited by the client, as it would arrive over the wire.
+fn edit_quote(
+    context: &PrepareCallsContext,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Result<PrepareCallsContext> {
+    let mut value = serde_json::to_value(context)?;
+    edit(&mut value["quote"]);
+    Ok(serde_json::from_value(value)?)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_send_refuses_altered_fee_payer_quote() -> Result<()> {
+    let env = Environment::setup_multi_chain(2).await?;
+    let main_key = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[main_key.to_authorized()], &main_key, AuthKind::Auth).await?;
+
+    let fee_payer = MockAccountBuilder::new().no_erc20_mint().build(&env).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider_for(0)).await?;
+    mint_erc20s(&[env.erc20], &[fee_payer.address], env.provider_for(1)).await?;
+
+    let response = env
+        .relay_endpoint
+        .prepare_calls(PrepareCallsParameters {
+            from: Some(env.eoa.address()),
+            calls: vec![Call::transfer(env.erc20, Address::random(), U256::from(100))],
+            chain_id: env.chain_id_for(0),
+            key: Some(main_key.to_call_key()),
+            capabilities: PrepareCallsCapabilities {
+                meta: Meta {
+                    fee_payer: Some(fee_payer.address),
+                    fee_token: Some(env.erc20),
+                    nonce: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let quote = response.context.quote().expect("should have a quote");
+    let fee_payer_quote = quote.ty().fee_payer_quote.as_ref().expect("should be cross-chain");
+    let fee_payer_digest = fee_payer_quote.digest();
+
+    let stripped = edit_quote(&response.context, |quote| {
+        quote.as_object_mut().unwrap().remove("feePayerQuote");
+    })?;
+    let swapped = edit_quote(&response.context, |quote| {
+        quote["feePayerQuote"]["txGas"] = "0x1".into();
+    })?;
+    let moved_to_root = edit_quote(&response.context, |quote| {
+        quote["feePayerQuote"] = serde_json::Value::Null;
+        quote["multiChainRoot"] = fee_payer_digest.to_string().into();
+    })?;
+
+    let signature = main_key.sign_payload_hash(response.digest).await?;
+    for (name, context) in [("stripped", stripped), ("swapped", swapped), ("moved", moved_to_root)]
+    {
+        let err = send_prepared_calls(&env, &main_key, signature.clone(), context)
+            .await
+            .expect_err("an altered quote must not be accepted");
+        assert!(err.to_string().contains("invalid quote signer"), "{name}: {err}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fee_payer_refused_by_default() -> Result<()> {
+    let mut env = Environment::setup().await?;
+    let main_key = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[main_key.to_authorized()], &main_key, AuthKind::Auth).await?;
+
+    let config = env.config.clone().with_fee_payers(Default::default());
+    env.restart_relay(config).await?;
+
+    let parameters = |fee_payer| PrepareCallsParameters {
+        from: Some(env.eoa.address()),
+        calls: vec![Call::transfer(env.erc20, Address::random(), U256::from(100))],
+        chain_id: env.chain_id(),
+        key: Some(main_key.to_call_key()),
+        capabilities: PrepareCallsCapabilities {
+            meta: Meta { fee_payer, fee_token: Some(env.erc20), nonce: None },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let err = env
+        .relay_endpoint
+        .prepare_calls(parameters(Some(Address::random())))
+        .await
+        .expect_err("a fee payer outside the allowlist must be refused");
+    assert!(err.to_string().contains("fee payer not allowed"), "{err}");
+
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+    env.relay_endpoint.prepare_calls(parameters(None)).await?;
+
     Ok(())
 }

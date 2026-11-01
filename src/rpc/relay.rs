@@ -72,7 +72,7 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 use crate::{
     auth::VerifiedSub,
     chains::{Chain, Chains},
-    config::QuoteConfig,
+    config::{FeePayerConfig, QuoteConfig},
     error::{AuthError, KeysError, QuoteError, RelayError},
     price::PriceOracle,
     rpc::{EthCallParameters, is_read_allowed},
@@ -82,7 +82,7 @@ use crate::{
     transactions::{RelayTransaction, TransactionStatus},
     types::{
         ChainSponsorshipConfig, CreatableAccount, FeeEstimationContext, Intent, KeyWith712Signer,
-        Orchestrator, PartialIntent, Quote, Signature, SignedQuotes, SponsorshipConfig,
+        Orchestrator, PartialIntent, Quote, QuoteRole, Signature, SignedQuotes, SponsorshipConfig,
         rpc::{
             AuthorizeKey, AuthorizeKeyResponse, BundleId, CallsStatus, CallsStatusCapabilities,
             GetKeysParameters, GetKeysResponse, PrepareCallsParameters, PrepareCallsResponse,
@@ -261,6 +261,7 @@ impl Relay {
         escrow_refund_threshold: u64,
         sponsorship_config: SponsorshipConfig,
         chain_sponsorship: std::collections::HashMap<ChainId, ChainSponsorshipConfig>,
+        fee_payers: FeePayerConfig,
     ) -> Self {
         let sponsorship =
             SponsorshipEvaluator::new(sponsorship_config, chain_sponsorship, storage.clone());
@@ -276,6 +277,7 @@ impl Relay {
             asset_info,
             escrow_refund_threshold,
             sponsorship,
+            fee_payers,
             confirmed_intents: Mutex::new(LruMap::new(ByLength::new(2048))),
             block_timestamps: Mutex::new(LruMap::new(ByLength::new(4096))),
         };
@@ -820,10 +822,13 @@ impl Relay {
         &self,
         bundle_id: BundleId,
         mut quote: Quote,
+        role: QuoteRole,
         capabilities: SendPreparedCallsCapabilities,
         signature: Bytes,
         user_id: Option<&str>,
     ) -> RpcResult<RelayTransaction> {
+        role.check(&quote)?;
+
         let chain_id = quote.chain_id;
         // todo: chain support should probably be checked before we send txs
         let provider = self.provider(chain_id)?;
@@ -2478,6 +2483,7 @@ impl Relay {
                 bundle_id,
                 // safety: we know there is 1 element
                 quotes.ty().quotes.first().unwrap().clone(),
+                QuoteRole::User,
                 capabilities,
                 signature,
                 user_id,
@@ -2564,10 +2570,17 @@ impl Relay {
                 signature.clone()
             };
 
-            self.prepare_tx(bundle_id, quote.clone(), capabilities.clone(), signature, user_id)
-                .await
-                .map(|tx| (idx, tx))
-                .map_err(|e| RelayError::InternalError(e.into()))
+            self.prepare_tx(
+                bundle_id,
+                quote.clone(),
+                QuoteRole::User,
+                capabilities.clone(),
+                signature,
+                user_id,
+            )
+            .await
+            .map(|tx| (idx, tx))
+            .map_err(|e| RelayError::InternalError(e.into()))
         });
 
         // Append transactions directly to bundle
@@ -2585,6 +2598,7 @@ impl Relay {
                 self.prepare_tx(
                     bundle_id,
                     (**fee_payer_quote).clone(),
+                    QuoteRole::FeePayer,
                     Default::default(),
                     capabilities.fee_signature.clone(),
                     user_id,
@@ -2986,6 +3000,11 @@ impl RelayApiServer for Relay {
         request: PrepareCallsParameters,
     ) -> RpcResult<PrepareCallsResponse> {
         tracing::Span::current().record("eth.chain_id", request.chain_id);
+        if let Some(fee_payer) = request.capabilities.meta.fee_payer
+            && !self.inner.fee_payers.permits(fee_payer)
+        {
+            return Err(QuoteError::FeePayerNotAllowed(fee_payer).into());
+        }
         // Verified by the JWT auth layer (spawn.rs); absent when unauthenticated
         // or when no `auth` config is set, in which case quota falls back to
         // address-mode.
@@ -4051,6 +4070,8 @@ pub(super) struct RelayInner {
     escrow_refund_threshold: u64,
     /// Gas-sponsorship policy evaluator.
     sponsorship: SponsorshipEvaluator,
+    /// Which addresses a client may name as fee payer.
+    fee_payers: FeePayerConfig,
     /// Intents decoded from confirmed transactions, keyed by chain and transaction hash.
     ///
     /// `wallet_getCallsHistory` is polled, and without this every poll refetches every

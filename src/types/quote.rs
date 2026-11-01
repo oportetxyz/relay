@@ -1,7 +1,7 @@
 //! Quote types.
 
 use crate::{
-    error::RelayError,
+    error::{QuoteError, RelayError},
     types::{AssetDeficits, Intent, Intents, Signed, VersionedContracts, rpc::KeyMetadataEntry},
 };
 use alloy::{
@@ -14,6 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A relay-signed [`Quotes`].
 pub type SignedQuotes = Signed<Quotes>;
+
+/// Separates the fee payer quote from the rest of [`Quotes::digest`].
+///
+/// why: the other optional fields are hashed in 32 byte words, so a bare digest here could be
+/// sent back as `multi_chain_root` and hash the same. This tag is not a multiple of 32 bytes.
+const FEE_PAYER_QUOTE_TAG: &[u8] = b"relay.quotes.feePayerQuote";
 
 /// A set of quotes from the relay with a set of intents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,6 +105,12 @@ impl Quotes {
         if let Some(root) = self.multi_chain_root {
             hasher.update(root);
         }
+        // why: puts the fee payer quote under the relay's signature. Nothing is added when there
+        // is none, so quotes without one hash as before.
+        if let Some(quote) = &self.fee_payer_quote {
+            hasher.update(FEE_PAYER_QUOTE_TAG);
+            hasher.update(quote.digest());
+        }
         // why: puts the metadata under the relay's signature. Nothing is added when there is
         // none, so quotes without it hash as before.
         for entry in &self.key_metadata {
@@ -112,6 +124,28 @@ impl Quotes {
 impl Sealable for Quotes {
     fn hash_slow(&self) -> B256 {
         self.digest()
+    }
+}
+
+/// Which side of a bundle a [`Quote`] pays for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteRole {
+    /// The user's own intent.
+    User,
+    /// The fee payer's intent, which only pays the fee.
+    FeePayer,
+}
+
+impl QuoteRole {
+    /// Refuses a quote this role must not send.
+    ///
+    /// why: the relay signs fund transfers with its funder key. They belong to a user's output
+    /// intent, and a fee payer quote never carries any.
+    pub fn check(self, quote: &Quote) -> Result<(), QuoteError> {
+        if self == Self::FeePayer && !quote.intent.encoded_fund_transfers().is_empty() {
+            return Err(QuoteError::FeePayerFundTransfers);
+        }
+        Ok(())
     }
 }
 
@@ -201,6 +235,10 @@ impl Quote {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::{
+        primitives::{Bytes, b256},
+        signers::{SignerSync, local::PrivateKeySigner},
+    };
 
     /// Test that ensures all fields in Quote affect the digest.
     ///
@@ -290,6 +328,130 @@ mod tests {
         let mut modified = base_quote.clone();
         modified.intent = modified.intent.with_eoa(Address::repeat_byte(1));
         assert_ne!(base_quote.digest(), modified.digest(), "intent must affect digest");
+    }
+
+    /// A quote with every field fixed, so its digest can be pinned.
+    fn fixed_quote(payment: u64) -> Quote {
+        Quote {
+            chain_id: 8453,
+            intent: Intent::default()
+                .with_eoa(Address::repeat_byte(1))
+                .with_payer(Address::ZERO)
+                .with_total_payment_max_amount(U256::from(payment)),
+            extra_payment: U256::from(100),
+            eth_price: U256::from(2000),
+            payment_token_decimals: 6,
+            tx_gas: 21000,
+            native_fee_estimate: Eip1559Estimation {
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 10,
+            },
+            authorization_address: None,
+            additional_authorization: None,
+            orchestrator: Address::repeat_byte(2),
+            fee_token_deficit: U256::ZERO,
+            asset_deficits: AssetDeficits::default(),
+        }
+    }
+
+    fn fixed_quotes(payment: u64, multi_chain_root: Option<B256>) -> Quotes {
+        Quotes {
+            quotes: vec![fixed_quote(payment)],
+            ttl: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            multi_chain_root,
+            fee_payer_quote: None,
+            key_metadata: vec![],
+        }
+    }
+
+    /// Digests taken from main at b92b1bab, before the fee payer quote was hashed. A change here
+    /// invalidates every quote in flight, sponsored ones included.
+    #[test]
+    fn quotes_digest_without_fee_payer_is_pinned() {
+        assert_eq!(
+            fixed_quotes(300, None).digest(),
+            b256!("0xb202836fa188bee9caf8ad9878dad1e4d07ee135b96d233f7e017b1263eb8d74"),
+            "unsponsored"
+        );
+        assert_eq!(
+            fixed_quotes(0, None).digest(),
+            b256!("0xdac902af7aab29624c74333910b0dfcecdad6885887f5149e9fb57b1029f32b0"),
+            "sponsored"
+        );
+        assert_eq!(
+            fixed_quotes(0, Some(B256::repeat_byte(3))).digest(),
+            b256!("0x805746c411c61d0aeed6e1c0674bacc504d663c68b148f0ec8adaba2b5d6eff1"),
+            "sponsored multichain"
+        );
+    }
+
+    fn sign(quotes: Quotes) -> (Address, serde_json::Value) {
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(7)).unwrap();
+        let signature = signer.sign_hash_sync(&quotes.digest()).unwrap();
+        (signer.address(), serde_json::to_value(quotes.into_signed(signature)).unwrap())
+    }
+
+    /// The signer recovered from a quote as the relay reads it on send.
+    fn recover(wire: serde_json::Value) -> Address {
+        serde_json::from_value::<SignedQuotes>(wire).unwrap().recover_address().unwrap()
+    }
+
+    #[test]
+    fn quotes_without_fee_payer_verify_with_null_or_absent_field() {
+        let (signer, wire) = sign(fixed_quotes(0, None));
+        assert!(wire["feePayerQuote"].is_null());
+        assert_eq!(recover(wire.clone()), signer);
+
+        let mut absent = wire;
+        absent.as_object_mut().unwrap().remove("feePayerQuote");
+        assert_eq!(recover(absent), signer);
+    }
+
+    #[test]
+    fn fee_payer_quote_is_bound_to_the_signature() {
+        let fee_payer_quote = fixed_quote(300);
+        let quotes = Quotes {
+            fee_payer_quote: Some(Box::new(fee_payer_quote.clone())),
+            ..fixed_quotes(0, None)
+        };
+        let (signer, wire) = sign(quotes);
+        assert_eq!(recover(wire.clone()), signer, "the quote as signed verifies");
+
+        let mut stripped = wire.clone();
+        stripped.as_object_mut().unwrap().remove("feePayerQuote");
+        assert_ne!(recover(stripped), signer, "stripped");
+
+        let mut nulled = wire.clone();
+        nulled["feePayerQuote"] = serde_json::Value::Null;
+        assert_ne!(recover(nulled), signer, "set to null");
+
+        let mut swapped = wire.clone();
+        swapped["feePayerQuote"]["txGas"] = "0x1".into();
+        assert_ne!(recover(swapped), signer, "swapped");
+
+        let mut with_transfers = wire.clone();
+        with_transfers["feePayerQuote"]["intent"]["encodedFundTransfers"] = vec!["0x01"].into();
+        assert_ne!(recover(with_transfers), signer, "fund transfers added");
+
+        // why: without the tag these two hash the same.
+        let mut moved = wire;
+        moved["feePayerQuote"] = serde_json::Value::Null;
+        moved["multiChainRoot"] = fee_payer_quote.digest().to_string().into();
+        assert_ne!(recover(moved), signer, "moved into the root");
+    }
+
+    #[test]
+    fn fund_transfers_are_refused_on_a_fee_payer_quote() {
+        let mut quote = fixed_quote(300);
+        assert!(QuoteRole::FeePayer.check(&quote).is_ok(), "no transfers");
+        assert!(QuoteRole::User.check(&quote).is_ok());
+
+        quote.intent = quote.intent.with_encoded_fund_transfers(vec![Bytes::from_static(&[1])]);
+        assert!(matches!(
+            QuoteRole::FeePayer.check(&quote),
+            Err(QuoteError::FeePayerFundTransfers)
+        ));
+        assert!(QuoteRole::User.check(&quote).is_ok(), "a user's output intent still may");
     }
 
     #[test]

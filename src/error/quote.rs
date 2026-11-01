@@ -17,6 +17,12 @@ pub enum QuoteError {
     /// The provided quote was not signed by the relay.
     #[error("invalid quote signer")]
     InvalidQuoteSignature,
+    /// The requested fee payer is not allowed on this relay.
+    #[error("fee payer not allowed: {0}")]
+    FeePayerNotAllowed(Address),
+    /// A fee payer quote carried fund transfers.
+    #[error("fund transfers are not allowed on a fee payer quote")]
+    FeePayerFundTransfers,
     /// The provided fee token is not supported.
     #[error("fee token not supported: {0}")]
     UnsupportedFeeToken(Address),
@@ -62,6 +68,8 @@ impl From<QuoteError> for jsonrpsee::types::error::ErrorObject<'static> {
             QuoteError::QuoteExpired
             | QuoteError::QuoteNotFound
             | QuoteError::InvalidQuoteSignature
+            | QuoteError::FeePayerNotAllowed(..)
+            | QuoteError::FeePayerFundTransfers
             | QuoteError::UnsupportedFeeToken(..)
             | QuoteError::InvalidNumberOfIntents { .. }
             | QuoteError::InvalidFeeAmount { .. }
