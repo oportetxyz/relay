@@ -730,7 +730,8 @@ pub struct CallsStatusCapabilities {
 pub struct GetCallsHistoryParameters {
     /// Account address to get call history for.
     pub address: Address,
-    /// Index to start from (defaults based on sort direction).
+    /// Index to start from, counted in the requested order (defaults to 0, the oldest bundle for
+    /// "asc" and the newest for "desc").
     #[serde(default)]
     pub index: Option<u64>,
     /// Number of bundles to fetch.

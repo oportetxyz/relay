@@ -3533,28 +3533,10 @@ impl RelayApiServer for Relay {
             return Err(RelayError::internal_msg("limit must be between 1 and 100").into());
         }
 
-        // Calculate offset from index
-        // Note: For desc sort with no index, we need total count (slow)
-        let (offset, sort_desc) = match params.sort {
-            SortDirection::Asc => {
-                let offset = params.index.unwrap_or(0);
-                (offset, false)
-            }
-            SortDirection::Desc => {
-                if let Some(index) = params.index {
-                    // User provided index - no count needed
-                    (index, true)
-                } else {
-                    // No index provided - must get total count to default to end (slow)
-                    // Spec: "If not provided, it will default to total bundle count for desc"
-                    let total =
-                        self.inner.storage.get_bundle_count_by_address(params.address).await?;
-
-                    // Start from the end
-                    (total.saturating_sub(params.limit), true)
-                }
-            }
-        };
+        // The index counts from the first entry in the requested order, so with no index a read
+        // starts at the oldest bundle for asc and at the newest for desc.
+        let offset = params.index.unwrap_or(0);
+        let sort_desc = matches!(params.sort, SortDirection::Desc);
 
         // Fetch bundles from underlying storage
         let bundles = self
