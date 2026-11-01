@@ -22,8 +22,8 @@ use futures_util::future::{join_all, try_join_all};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use relay::{
     config::{
-        ChainConfig, InteropConfig, LegacyOrchestrator, RebalanceServiceConfig, RelayConfig,
-        SettlerConfig, SettlerImplementation, SignerConfig, SimpleSettlerConfig,
+        ChainConfig, FeePayerConfig, InteropConfig, LegacyOrchestrator, RebalanceServiceConfig,
+        RelayConfig, SettlerConfig, SettlerImplementation, SignerConfig, SimpleSettlerConfig,
         TransactionServiceConfig,
     },
     provider::ProviderExt,
@@ -738,7 +738,9 @@ impl Environment {
             .with_legacy_orchestrators(&[contracts.legacy_orchestrator])
             .with_legacy_delegation_proxies(&[contracts.legacy_delegation_proxy])
             .with_resend_api_key(Some("test_resend_key".to_string()))
-            .with_onramp_worker_secret(Some("test_onramp_secret".to_string()));
+            .with_onramp_worker_secret(Some("test_onramp_secret".to_string()))
+            // why: test fee payers are random addresses or contracts deployed after boot.
+            .with_fee_payers(FeePayerConfig { allow_any: true, ..Default::default() });
 
         let relay_handle = try_spawn(config.clone(), skip_diagnostics).await?;
 

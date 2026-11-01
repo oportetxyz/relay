@@ -950,6 +950,7 @@ mod tests {
                 multi_chain_root: Some(B256::ZERO),
                 fee_payer_quote: None,
                 key_metadata: Vec::new(),
+                quota_subject: None,
             }
             .into_signed(signer.sign_hash(&B256::ZERO).await?),
         ));

@@ -7,14 +7,21 @@
 
 use crate::e2e::{
     AuthKind,
-    cases::{upgrade_account_eagerly, upgrade_account_lazily},
+    cases::{
+        sponsorship::{REVERTS, assert_booked, booked, latest_transaction, wait_for_mempool},
+        upgrade_account_eagerly, upgrade_account_lazily,
+    },
     environment::Environment,
     send_prepared_calls,
 };
-use alloy::primitives::{B256, U256};
+use alloy::{
+    primitives::{B256, U256},
+    providers::ext::AnvilApi,
+};
 use relay::{
     rpc::RelayApiClient,
     signers::Eip712PayLoadSigner,
+    storage::StorageApi,
     types::{
         KeyType, KeyWith712Signer, MULTICHAIN_NONCE_PREFIX, SignedCalls, SponsorshipConfig,
         rpc::{
@@ -112,6 +119,76 @@ async fn assert_recovery_key_on_chain(
     if let Some(found) = found {
         assert!(found.authorize_key.key.isSuperAdmin, "granted as admin");
     }
+}
+
+/// The relay paid for a transaction that reverts as much as for one that lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn books_a_landing_that_reverts() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    sponsor_everything(&mut env).await?;
+
+    let admin = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    let recovery = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[admin.to_authorized()], &admin, AuthKind::Auth).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+
+    // The upgrade above was sponsored too.
+    let before = booked(&env).await?;
+
+    env.disable_mining().await;
+    let (landing, mined) = tokio::join!(execute(&env), async {
+        wait_for_mempool(&env).await?;
+        env.provider().anvil_set_code(env.orchestrator, REVERTS).await?;
+        env.mine_block().await;
+        latest_transaction(&env).await
+    });
+    let (receipt, spent) = mined?;
+
+    assert!(!receipt.status());
+    assert!(landing.is_err_and(|err| err.to_string().contains("reverted")));
+    assert_booked(&env, before + spent).await
+}
+
+/// The relay pays once the transaction is out, so the caller leaving changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn books_a_landing_the_caller_left() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    sponsor_everything(&mut env).await?;
+
+    let admin = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    let recovery = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[admin.to_authorized()], &admin, AuthKind::Auth).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+    let before = booked(&env).await?;
+
+    env.disable_mining().await;
+    let mut landing = Box::pin(execute(&env));
+    tokio::select! {
+        result = &mut landing => eyre::bail!("the landing finished unmined: {result:?}"),
+        sent = wait_for_mempool(&env) => sent?,
+    }
+    // why: dropping the request closes its connection, which ends the handler.
+    drop(landing);
+
+    env.mine_block().await;
+    let (receipt, spent) = latest_transaction(&env).await?;
+    assert!(receipt.status());
+
+    let expected = before + spent;
+    for _ in 0..50 {
+        if booked(&env).await? >= expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_booked(&env, expected).await?;
+
+    // why: the handler removes the precalls once it sees the status, so finding them here shows
+    // it was really gone. A live handler would have had this long to remove them.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let stored = env.relay_handle.storage.read_precalls_for_eoa(env.chain_id(), env.eoa.address());
+    assert!(!stored.await?.is_empty(), "the handler outlived the caller");
+    Ok(())
 }
 
 /// The account has never been used on this chain: the relay must carry the 7702

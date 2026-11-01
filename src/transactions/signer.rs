@@ -166,6 +166,16 @@ pub struct SignerInner {
     asset_info: AssetInfoServiceHandle,
 }
 
+/// Waits between attempts to store a confirmed transaction, about 16s in total.
+const CONFIRMATION_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+
 /// A signer responsible for signing and sending transactions on a _single_ network.
 #[derive(Debug, Clone, derive_more::Deref)]
 pub struct Signer {
@@ -287,6 +297,21 @@ impl Signer {
         Ok(adjusted_fees)
     }
 
+    /// Stores the outcome of a confirmed transaction. Every step is safe to repeat.
+    async fn store_confirmation(
+        &self,
+        tx: &PendingTransaction,
+        receipt: &TransactionReceipt,
+    ) -> Result<(), StorageError> {
+        // why: first, so that a failure or a restart leaves the pending row in place, and the
+        // ledger drops repeats by hash.
+        self.book_sponsored_spend(&tx.tx, receipt).await?;
+
+        self.update_tx_status(tx.id(), TransactionStatus::Confirmed(Box::new(receipt.clone())))
+            .await?;
+        self.storage.remove_pending_transaction(tx.id()).await
+    }
+
     /// Invoked when a transaction is confirmed.
     #[instrument(skip_all)]
     async fn on_confirmed_transaction(
@@ -294,9 +319,18 @@ impl Signer {
         tx: PendingTransaction,
         receipt: TransactionReceipt,
     ) -> Result<(), StorageError> {
-        self.update_tx_status(tx.id(), TransactionStatus::Confirmed(Box::new(receipt.clone())))
-            .await?;
-        self.storage.remove_pending_transaction(tx.id()).await?;
+        // why: nothing else retries a failed write. Once the delays run out the pending row stays
+        // and this transaction is only picked up again by a restart, with its account's later
+        // intents waiting behind it and no final status for anyone waiting on it.
+        let mut delays = CONFIRMATION_RETRY_DELAYS.iter();
+        while let Err(err) = self.store_confirmation(&tx, &receipt).await {
+            let Some(delay) = delays.next() else {
+                self.metrics.confirmation_write_failures.increment(1);
+                return Err(err);
+            };
+            warn!(%err, tx_id = %tx.id(), ?delay, "failed to store a confirmation, retrying");
+            tokio::time::sleep(*delay).await;
+        }
 
         self.metrics
             .confirmation_time
@@ -876,6 +910,39 @@ impl Signer {
         Ok(())
     }
 
+    /// Books what a landed transaction cost against the sponsorship ledger, feeding the
+    /// per-subject quota and the global circuit breaker.
+    ///
+    /// The relay paid for the transaction whatever it did on chain, so the outcome plays no part
+    /// here. The quota subject was bound to the quote at prepare per the chain's policy
+    /// (address or verified user); fall back to the address for legacy txs with no stored subject.
+    async fn book_sponsored_spend(
+        &self,
+        tx: &RelayTransaction,
+        receipt: &TransactionReceipt,
+    ) -> Result<(), StorageError> {
+        let Some(eoa) = tx.sponsored_account() else {
+            return Ok(());
+        };
+
+        let gas_used = U256::from(receipt.gas_used);
+        let gas_price = U256::from(receipt.effective_gas_price);
+        self.storage
+            .record_sponsorship_usage(SponsorshipUsage {
+                user_address: eoa,
+                quota_subject: tx
+                    .quota_subject
+                    .as_ref()
+                    .map_or_else(|| eoa.to_string(), |subject| subject.as_str().to_owned()),
+                chain_id: self.chain_id,
+                tx_hash: receipt.transaction_hash.to_string(),
+                gas_used,
+                gas_price,
+                eth_spent: gas_used * gas_price,
+            })
+            .await
+    }
+
     /// Fetches receipt of a confirmed transaction and records metrics.
     async fn record_confirmed_metrics(&self, tx: PendingTransaction, receipt: TransactionReceipt) {
         if !tx.tx.is_intent() {
@@ -905,34 +972,6 @@ impl Signer {
             warn!(%tx_hash, err = %event.err, signer = %self.address(), chain_id = %self.chain_id, "intent failed on-chain");
             self.metrics.failed_intents.increment(1);
             return;
-        }
-
-        // Record sponsored gas usage: a zero-payment intent means the relay funder
-        // covered the on-chain gas (see rpc::relay build_quotes). Feed the per-subject
-        // quota + global circuit breaker. ponytail: zero-payment also holds for an
-        // external fee_payer, which we don't expose to clients, so it currently marks
-        // our own sponsorship. The quota subject was resolved at send time per the
-        // chain's policy (address or verified user); fall back to the address for
-        // legacy txs with no stored subject.
-        if let RelayTransactionKind::Intent { quote, .. } = &tx.tx.kind
-            && quote.intent.total_payment_max_amount().is_zero()
-        {
-            let eoa = *quote.intent.eoa();
-            let quota_subject = tx.tx.quota_subject.clone().unwrap_or_else(|| eoa.to_string());
-            let gas_used = U256::from(receipt.gas_used);
-            let gas_price = U256::from(receipt.effective_gas_price);
-            let usage = SponsorshipUsage {
-                user_address: eoa,
-                quota_subject,
-                chain_id: self.chain_id,
-                tx_hash: tx_hash.to_string(),
-                gas_used,
-                gas_price,
-                eth_spent: gas_used * gas_price,
-            };
-            if let Err(e) = self.storage.record_sponsorship_usage(usage).await {
-                warn!(%tx_hash, error = %e, "failed to record sponsorship usage");
-            }
         }
 
         // The inclusion time comes from the receipt's logs when the node sets `blockTimestamp`, so
