@@ -103,6 +103,12 @@ pub enum RelayError {
         /// The chain.
         chain: ChainId,
     },
+    /// The session token does not list the address a sponsored request is for.
+    #[error("{eoa} is not in the session token")]
+    AddressNotInToken {
+        /// The account.
+        eoa: Address,
+    },
     /// The orchestrator is not supported.
     #[error("unsupported orchestrator {0}")]
     UnsupportedOrchestrator(Address),
@@ -201,6 +207,9 @@ impl From<RelayError> for jsonrpsee::types::error::ErrorObject<'static> {
             | RelayError::UnsupportedChain(_)
             | RelayError::UnsupportedOrchestrator(_)
             | RelayError::UnsupportedAsset { .. } => invalid_params(err.to_string()),
+            RelayError::AddressNotInToken { .. } => {
+                rpc_err(ADDRESS_NOT_IN_TOKEN_CODE, err.to_string(), None)
+            }
             RelayError::ReadRequiresAuth => {
                 rpc_err(jsonrpsee::types::error::INVALID_REQUEST_CODE, err.to_string(), None)
             }
@@ -221,6 +230,10 @@ impl From<RelayError> for jsonrpsee::types::error::ErrorObject<'static> {
 
 /// EIP-1474 "resource unavailable" error code.
 const RESOURCE_UNAVAILABLE_CODE: i32 = -32002;
+
+/// A sponsored request for an address its token does not list. Clients refresh the token and
+/// retry once on this code.
+const ADDRESS_NOT_IN_TOKEN_CODE: i32 = -32090;
 
 /// Constructs an invalid params JSON‑RPC error.
 fn invalid_params(msg: impl Into<String>) -> jsonrpsee::types::error::ErrorObject<'static> {

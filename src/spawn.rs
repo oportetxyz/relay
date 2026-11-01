@@ -275,7 +275,8 @@ pub async fn try_spawn(config: RelayConfig, skip_diagnostics: bool) -> eyre::Res
                 subject: auth.dev_subject.clone().unwrap_or_else(|| "dev-local".to_string()),
             })
         });
-        JwtAuthLayer::new(cache, dev)
+        let enforce_wallets = config.auth.as_ref().is_some_and(|auth| auth.enforce_wallet_claim);
+        JwtAuthLayer::new(cache, dev, enforce_wallets)
     };
 
     // start server
@@ -466,6 +467,7 @@ mod tests {
     fn cfg_with_hatch(dev_subject: Option<&str>, override_wei: Option<u128>) -> RelayConfig {
         let mut config = RelayConfig {
             auth: Some(AuthConfig {
+                enforce_wallet_claim: false,
                 jwks_url: "http://127.0.0.1:1/jwks".to_string(),
                 dev_api_key: Some("dev-secret".to_string()),
                 dev_subject: dev_subject.map(str::to_owned),

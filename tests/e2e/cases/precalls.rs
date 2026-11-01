@@ -8,16 +8,20 @@
 use crate::e2e::{
     AuthKind,
     cases::{
-        sponsorship::{REVERTS, assert_booked, booked, latest_transaction, wait_for_mempool},
+        sponsorship::{
+            REVERTS, TOKEN_DEV_KEY, assert_booked, assert_not_in_token, booked, client_with,
+            latest_transaction, serve_jwks, token, token_auth, wait_for_mempool,
+        },
         upgrade_account_eagerly, upgrade_account_lazily,
     },
     environment::Environment,
     send_prepared_calls,
 };
 use alloy::{
-    primitives::{B256, U256},
+    primitives::{Address, B256, U256},
     providers::ext::AnvilApi,
 };
+use jsonrpsee::http_client::HttpClientBuilder;
 use relay::{
     rpc::RelayApiClient,
     signers::Eip712PayLoadSigner,
@@ -337,5 +341,40 @@ async fn one_signature_lands_on_every_chain() -> eyre::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_landing_needs_the_address_in_the_token() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let (signing, jwks_url) = serve_jwks().await?;
+    env.config.auth = Some(token_auth(jwks_url, true));
+    let mut config = env.config.clone();
+    config.sponsorship = SponsorshipConfig {
+        sponsor_all: true,
+        quota_overrides: [("dev-local".to_string(), u128::MAX)].into(),
+        ..Default::default()
+    };
+    env.restart_relay(config).await?;
+    // why: the setup sends no token of its own, which this relay refuses.
+    let without_token = HttpClientBuilder::default().build(env.relay_handle.http_url())?;
+    env.relay_endpoint = client_with(&env, TOKEN_DEV_KEY)?;
+
+    let admin = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    let recovery = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[admin.to_authorized()], &admin, AuthKind::Auth).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+
+    let parameters =
+        || ExecutePreCallsParameters { address: env.eoa.address(), chain_id: env.chain_id() };
+    assert_not_in_token(without_token.execute_pre_calls(parameters()).await.map_err(Into::into));
+
+    let outside = serde_json::json!([format!("{:#x}", Address::random())]);
+    let client = client_with(&env, &token(&signing, Some(outside)))?;
+    assert_not_in_token(client.execute_pre_calls(parameters()).await.map_err(Into::into));
+
+    let listed = serde_json::json!([format!("{:#x}", env.eoa.address())]);
+    let client = client_with(&env, &token(&signing, Some(listed)))?;
+    assert!(!client.execute_pre_calls(parameters()).await?.nonces.is_empty());
     Ok(())
 }

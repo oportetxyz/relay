@@ -178,6 +178,10 @@ pub struct AuthConfig {
     /// dedicated `sponsorship.quota_overrides` entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_subject: Option<String>,
+    /// Refuse a sponsored request whose address is not in the token's `wallets` claim. A token
+    /// without the claim is refused too, and the dev hatch has no token to check. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enforce_wallet_claim: bool,
 }
 
 impl RelayConfig {

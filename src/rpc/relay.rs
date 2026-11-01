@@ -72,7 +72,7 @@ use tokio::try_join;
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use crate::{
-    auth::VerifiedSub,
+    auth::{TokenWallets, VerifiedSub},
     chains::{Chain, Chains},
     config::{FeePayerConfig, QuoteConfig},
     error::{AuthError, KeysError, QuoteError, RelayError},
@@ -1456,7 +1456,7 @@ impl Relay {
     async fn prepare_calls_inner(
         &self,
         mut request: PrepareCallsParameters,
-        user_id: Option<&str>,
+        caller: Caller<'_>,
     ) -> RpcResult<PrepareCallsResponse> {
         // Checks calls and precall calls in the request
         request.check_calls(self.contracts().delegation_implementation())?;
@@ -1527,7 +1527,7 @@ impl Relay {
                 metadata_entries(&request.capabilities.authorize_keys).map_err(RelayError::from)?;
 
             let (mut asset_diffs, mut quotes) = self
-                .build_quotes(&request, &identity, nonce, delegation_status, user_id, true)
+                .build_quotes(&request, &identity, nonce, delegation_status, caller, true)
                 .await?;
             quotes.key_metadata = key_metadata.clone();
 
@@ -1540,7 +1540,7 @@ impl Relay {
                 .then(|| {
                     self.inner.sponsorship.resolve_quota_subject(
                         identity.root_eoa,
-                        user_id,
+                        caller.user_id,
                         request.chain_id,
                     )
                 })
@@ -1573,7 +1573,7 @@ impl Relay {
                     .await?
             {
                 (asset_diffs, quotes) = self
-                    .build_quotes(&request, &identity, nonce, delegation_status, user_id, false)
+                    .build_quotes(&request, &identity, nonce, delegation_status, caller, false)
                     .await?;
                 quotes.key_metadata = key_metadata;
             }
@@ -1912,14 +1912,14 @@ impl Relay {
     /// - Since simulating it as a multichain intent raises the fees, we need to source funds again;
     ///   we continue this process a number of times, until `balance + funding - required_assets -
     ///   fee >= 0`.
-    #[instrument(skip(self, request, delegation_status, user_id), fields(chain_id = request.chain_id))]
+    #[instrument(skip(self, request, delegation_status, caller), fields(chain_id = request.chain_id))]
     async fn build_quotes(
         &self,
         request: &PrepareCallsParameters,
         identity: &IdentityParameters,
         nonce: U256,
         delegation_status: &DelegationStatus,
-        user_id: Option<&str>,
+        caller: Caller<'_>,
         sponsorable: bool,
     ) -> RpcResult<(AssetDiffResponse, Quotes)> {
         // Gas-sponsorship decision (Model A), evaluated once and applied to BOTH
@@ -1931,8 +1931,11 @@ impl Relay {
             && self
                 .inner
                 .sponsorship
-                .is_sponsored(identity.root_eoa, user_id, &request.calls, request.chain_id)
+                .is_sponsored(identity.root_eoa, caller.user_id, &request.calls, request.chain_id)
                 .await?;
+        if sponsored && caller.wallets.is_some_and(|wallets| !wallets.permits(identity.root_eoa)) {
+            return Err(RelayError::AddressNotInToken { eoa: identity.root_eoa }.into());
+        }
 
         let requested_with_balances = if !request.capabilities.required_funds.is_empty() {
             let requested_balances = self
@@ -3100,7 +3103,8 @@ impl RelayApiServer for Relay {
         // or when no `auth` config is set, in which case quota falls back to
         // address-mode.
         let user_id = ext.get::<VerifiedSub>().map(|sub| sub.0.as_str());
-        self.prepare_calls_inner(request, user_id).await
+        let wallets = ext.get::<TokenWallets>();
+        self.prepare_calls_inner(request, Caller { user_id, wallets }).await
     }
 
     async fn prepare_upgrade_account(
@@ -3967,6 +3971,9 @@ impl RelayApiServer for Relay {
         let ExecutePreCallsParameters { address: eoa, chain_id } = parameters;
         tracing::Span::current().record("eth.chain_id", chain_id);
         let user_id = ext.get::<VerifiedSub>().map(|sub| sub.0.as_str());
+        if ext.get::<TokenWallets>().is_some_and(|wallets| !wallets.permits(eoa)) {
+            return Err(RelayError::AddressNotInToken { eoa }.into());
+        }
 
         let chain =
             self.inner.chains.get(chain_id).ok_or(RelayError::UnsupportedChain(chain_id))?;
@@ -4141,6 +4148,15 @@ impl RelayApiServer for Relay {
             .map_err(RelayError::from)?
             .ok_or_else(|| RelayError::QuotaNeedsAccount.into())
     }
+}
+
+/// Who a request came from, as far as the auth layer could tell.
+#[derive(Debug, Clone, Copy)]
+struct Caller<'a> {
+    /// The verified user id.
+    user_id: Option<&'a str>,
+    /// The addresses the caller's token lists, when that is being enforced.
+    wallets: Option<&'a TokenWallets>,
 }
 
 /// Implementation of the Ithaca `relay_` namespace.
