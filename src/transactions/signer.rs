@@ -166,6 +166,16 @@ pub struct SignerInner {
     asset_info: AssetInfoServiceHandle,
 }
 
+/// Waits between attempts to store a confirmed transaction, about 16s in total.
+const CONFIRMATION_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+
 /// A signer responsible for signing and sending transactions on a _single_ network.
 #[derive(Debug, Clone, derive_more::Deref)]
 pub struct Signer {
@@ -287,6 +297,21 @@ impl Signer {
         Ok(adjusted_fees)
     }
 
+    /// Stores the outcome of a confirmed transaction. Every step is safe to repeat.
+    async fn store_confirmation(
+        &self,
+        tx: &PendingTransaction,
+        receipt: &TransactionReceipt,
+    ) -> Result<(), StorageError> {
+        // why: first, so that a failure or a restart leaves the pending row in place, and the
+        // ledger drops repeats by hash.
+        self.book_sponsored_spend(&tx.tx, receipt).await?;
+
+        self.update_tx_status(tx.id(), TransactionStatus::Confirmed(Box::new(receipt.clone())))
+            .await?;
+        self.storage.remove_pending_transaction(tx.id()).await
+    }
+
     /// Invoked when a transaction is confirmed.
     #[instrument(skip_all)]
     async fn on_confirmed_transaction(
@@ -294,13 +319,18 @@ impl Signer {
         tx: PendingTransaction,
         receipt: TransactionReceipt,
     ) -> Result<(), StorageError> {
-        // why: first, so that a failed write or a restart leaves the pending row in place and the
-        // receipt is booked when it is watched again. The ledger drops repeats by hash.
-        self.book_sponsored_spend(&tx.tx, &receipt).await?;
-
-        self.update_tx_status(tx.id(), TransactionStatus::Confirmed(Box::new(receipt.clone())))
-            .await?;
-        self.storage.remove_pending_transaction(tx.id()).await?;
+        // why: nothing else retries a failed write. Once the delays run out the pending row stays
+        // and this transaction is only picked up again by a restart, with its account's later
+        // intents waiting behind it and no final status for anyone waiting on it.
+        let mut delays = CONFIRMATION_RETRY_DELAYS.iter();
+        while let Err(err) = self.store_confirmation(&tx, &receipt).await {
+            let Some(delay) = delays.next() else {
+                self.metrics.confirmation_write_failures.increment(1);
+                return Err(err);
+            };
+            warn!(%err, tx_id = %tx.id(), ?delay, "failed to store a confirmation, retrying");
+            tokio::time::sleep(*delay).await;
+        }
 
         self.metrics
             .confirmation_time

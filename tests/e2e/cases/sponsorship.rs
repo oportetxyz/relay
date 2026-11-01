@@ -7,7 +7,7 @@ use crate::e2e::{
     send_prepared_calls,
 };
 use alloy::{
-    primitives::{Address, Bytes, U256, bytes},
+    primitives::{Address, B256, Bytes, U256, bytes},
     providers::{Provider, ext::AnvilApi},
     rpc::types::TransactionReceipt,
 };
@@ -18,10 +18,13 @@ use relay::{
     types::{
         Call, KeyType, KeyWith712Signer,
         OrchestratorContract::IntentExecuted,
-        SponsorshipConfig,
-        rpc::{Meta, PrepareCallsCapabilities, PrepareCallsParameters, PrepareCallsResponse},
+        SponsorshipConfig, SponsorshipUsage,
+        rpc::{
+            BundleId, Meta, PrepareCallsCapabilities, PrepareCallsParameters, PrepareCallsResponse,
+        },
     },
 };
+use sqlx::{PgPool, raw_sql};
 use std::time::Duration;
 
 /// `PUSH1 0 PUSH1 0 REVERT`
@@ -236,4 +239,165 @@ async fn failed_spend_counts_against_the_quota() -> eyre::Result<()> {
     assert!(!charged(&prepare(&env, &key).await?).is_zero());
 
     Ok(())
+}
+
+/// Makes every write to the sponsorship ledger fail, as a database fault would, until
+/// [`Self::allow`]. Postgres only: the in-memory ledger has no way to fail.
+struct RefusedLedger(PgPool);
+
+impl RefusedLedger {
+    /// Starts refusing, or `None` when the relay is not on Postgres.
+    async fn start(env: &Environment) -> eyre::Result<Option<Self>> {
+        let Some(url) = &env.config.database_url else { return Ok(None) };
+        let pool = PgPool::connect(url).await?;
+        raw_sql(
+            "CREATE FUNCTION refuse_booking() RETURNS trigger LANGUAGE plpgsql AS
+                $$ BEGIN RAISE EXCEPTION 'ledger refused'; END $$;
+             CREATE TRIGGER refuse_booking BEFORE INSERT ON sponsorship_usage
+                FOR EACH ROW EXECUTE FUNCTION refuse_booking();",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(Some(Self(pool)))
+    }
+
+    async fn allow(&self) -> eyre::Result<()> {
+        raw_sql("DROP TRIGGER refuse_booking ON sponsorship_usage").execute(&self.0).await?;
+        Ok(())
+    }
+}
+
+/// A sponsored intent landed while the ledger refuses it.
+struct RefusedLanding {
+    ledger: RefusedLedger,
+    bundle_id: BundleId,
+    signer: Address,
+    spent: U256,
+}
+
+impl RefusedLanding {
+    /// Lands one on a fresh account, or `None` when the relay is not on Postgres.
+    async fn land() -> eyre::Result<Option<(Environment, Self)>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let mut env = Environment::setup().await?;
+        let sponsor_all = SponsorshipConfig { sponsor_all: true, ..Default::default() };
+        let key = account(&mut env, sponsor_all).await?;
+        mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+        let response = prepare(&env, &key).await?;
+        let signature = key.sign_payload_hash(response.digest).await?;
+        let ledger = RefusedLedger::start(&env).await?.expect("a relay on Postgres");
+
+        env.disable_mining().await;
+        let bundle_id = send_prepared_calls(&env, &key, signature, response.context).await?;
+        wait_for_mempool(&env).await?;
+        env.mine_block().await;
+        let (receipt, spent) = latest_transaction(&env).await?;
+        env.enable_mining().await;
+
+        let landing = Self { ledger, bundle_id, signer: receipt.from, spent };
+        Ok(Some((env, landing)))
+    }
+
+    /// How many transactions the signer still holds as pending.
+    async fn pending(&self, env: &Environment) -> eyre::Result<usize> {
+        let storage = &env.relay_handle.storage;
+        Ok(storage.read_pending_transactions(self.signer, env.chain_id()).await?.len())
+    }
+
+    /// Fails unless the failed write held everything back.
+    async fn assert_held(&self, env: &Environment) -> eyre::Result<()> {
+        assert_booked(env, U256::ZERO).await?;
+        assert_eq!(self.pending(env).await?, 1, "the pending row is the only way back");
+        let status = env.relay_endpoint.get_calls_status(self.bundle_id).await.ok();
+        assert!(status.is_none_or(|status| status.receipts.is_empty()), "confirmed unbooked");
+        Ok(())
+    }
+
+    /// Fails unless the landing ended booked, confirmed and off the pending rows.
+    async fn assert_finished(&self, env: &Environment) -> eyre::Result<()> {
+        await_calls_status(env, self.bundle_id).await?;
+        assert_booked(env, self.spent).await?;
+        assert_eq!(self.pending(env).await?, 0);
+        Ok(())
+    }
+}
+
+/// The signer's count of confirmations it gave up on, summed over its signers.
+fn write_failures(env: &Environment) -> u64 {
+    let chain_id = format!("chain_id=\"{}\"", env.chain_id());
+    env.relay_handle
+        .metrics
+        .render()
+        .lines()
+        .filter(|line| {
+            line.starts_with("signer_confirmation_write_failures{") && line.contains(&chain_id)
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// A write that fails once holds the confirmation back, and the next attempt lands it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_booking_is_retried() -> eyre::Result<()> {
+    let Some((env, landing)) = RefusedLanding::land().await? else { return Ok(()) };
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    landing.assert_held(&env).await?;
+
+    landing.ledger.allow().await?;
+    landing.assert_finished(&env).await
+}
+
+/// Past the retries the row stays and nothing books it, until a restart replays it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_booking_out_of_retries_is_replayed_after_a_restart() -> eyre::Result<()> {
+    let Some((mut env, landing)) = RefusedLanding::land().await? else { return Ok(()) };
+
+    let before = write_failures(&env);
+    for _ in 0..300 {
+        if write_failures(&env) > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(write_failures(&env), before + 1);
+    landing.assert_held(&env).await?;
+
+    landing.ledger.allow().await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    landing.assert_held(&env).await?;
+
+    env.restart_relay(env.config.clone()).await?;
+    for _ in 0..100 {
+        if landing.pending(&env).await? == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    landing.assert_finished(&env).await
+}
+
+/// A replayed receipt counts once in the ledger the relay runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ledger_counts_a_repeated_hash_once() -> eyre::Result<()> {
+    let env = Environment::setup().await?;
+    let spent = U256::from(21_000);
+    let usage = SponsorshipUsage {
+        user_address: env.eoa.address(),
+        quota_subject: env.eoa.address().to_string(),
+        chain_id: env.chain_id(),
+        tx_hash: B256::repeat_byte(1).to_string(),
+        gas_used: spent,
+        gas_price: U256::from(1),
+        eth_spent: spent,
+    };
+
+    let storage = &env.relay_handle.storage;
+    storage.record_sponsorship_usage(usage.clone()).await?;
+    storage.record_sponsorship_usage(usage).await?;
+
+    assert_booked(&env, spent).await
 }

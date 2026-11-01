@@ -21,6 +21,7 @@ use alloy::{
 use relay::{
     rpc::RelayApiClient,
     signers::Eip712PayLoadSigner,
+    storage::StorageApi,
     types::{
         KeyType, KeyWith712Signer, MULTICHAIN_NONCE_PREFIX, SignedCalls, SponsorshipConfig,
         rpc::{
@@ -180,7 +181,14 @@ async fn books_a_landing_the_caller_left() -> eyre::Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_booked(&env, expected).await
+    assert_booked(&env, expected).await?;
+
+    // why: the handler removes the precalls once it sees the status, so finding them here shows
+    // it was really gone. A live handler would have had this long to remove them.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let stored = env.relay_handle.storage.read_precalls_for_eoa(env.chain_id(), env.eoa.address());
+    assert!(!stored.await?.is_empty(), "the handler outlived the caller");
+    Ok(())
 }
 
 /// The account has never been used on this chain: the relay must carry the 7702
