@@ -11,7 +11,9 @@ use alloy::{
     providers::{Provider, ext::AnvilApi},
     rpc::types::TransactionReceipt,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{TimeDelta, Utc};
+use ed25519_dalek::Signer;
 use futures_util::future::join_all;
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -31,6 +33,7 @@ use relay::{
 };
 use sqlx::{PgPool, raw_sql};
 use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// `PUSH1 0 PUSH1 0 REVERT`
 pub(super) const REVERTS: Bytes = bytes!("60006000fd");
@@ -468,6 +471,7 @@ async fn books_the_subject_bound_at_prepare() -> eyre::Result<()> {
         jwks_url: "http://127.0.0.1:1/jwks".to_string(),
         dev_api_key: Some(DEV_KEY.to_string()),
         dev_subject: None,
+        enforce_wallet_claim: false,
     });
     let key = account(&mut env, sponsorship).await?;
     mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
@@ -721,8 +725,11 @@ async fn a_send_that_failed_can_go_again() -> eyre::Result<()> {
 
 /// The live holds of the test account.
 async fn held(env: &Environment) -> eyre::Result<U256> {
-    let subject = env.eoa.address().to_string();
-    Ok(env.relay_handle.storage.held_sponsorship_wei(&subject, env.chain_id()).await?)
+    held_for(env, &env.eoa.address().to_string()).await
+}
+
+async fn held_for(env: &Environment, subject: &str) -> eyre::Result<U256> {
+    Ok(env.relay_handle.storage.held_sponsorship_wei(subject, env.chain_id()).await?)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -957,6 +964,7 @@ async fn the_reported_quota_leaves_out_what_is_held() -> eyre::Result<()> {
         jwks_url: "http://127.0.0.1:1/jwks".to_string(),
         dev_api_key: Some(DEV_KEY.to_string()),
         dev_subject: None,
+        enforce_wallet_claim: false,
     });
     let key = account(&mut env, sponsorship).await?;
     mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
@@ -978,5 +986,186 @@ async fn the_reported_quota_leaves_out_what_is_held() -> eyre::Result<()> {
     let held = held(&env).await?;
     assert!(!held.is_zero() && held < max_cost(&response));
     assert_eq!(quota.remaining_wei, cap - held);
+    Ok(())
+}
+
+const TOKEN_KID: &str = "e2e-kid";
+pub(super) const TOKEN_DEV_KEY: &str = "e2e-dev-key";
+
+/// Serves a JWKS for a fresh key, as the app's auth server would, and returns the key and url.
+pub(super) async fn serve_jwks() -> eyre::Result<(ed25519_dalek::SigningKey, String)> {
+    let key = ed25519_dalek::SigningKey::from_bytes(&B256::random().0);
+    let body = serde_json::json!({ "keys": [{
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": TOKEN_KID,
+        "x": URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+    }]})
+    .to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/jwks", listener.local_addr()?);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    Ok((key, url))
+}
+
+/// Signs a token for one user, with `wallets` as its claim when given.
+pub(super) fn token(key: &ed25519_dalek::SigningKey, wallets: Option<serde_json::Value>) -> String {
+    let mut payload = serde_json::json!({ "sub": "user-1", "exp": 32_503_680_000i64 });
+    if let Some(wallets) = wallets {
+        payload["wallets"] = wallets;
+    }
+    let header = serde_json::json!({ "alg": "EdDSA", "kid": TOKEN_KID });
+    let input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(payload.to_string())
+    );
+    let signature = key.sign(input.as_bytes()).to_bytes();
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+/// A client that sends `bearer`.
+pub(super) fn client_with(env: &Environment, bearer: &str) -> eyre::Result<HttpClient> {
+    Ok(HttpClientBuilder::default()
+        .set_headers(HeaderMap::from_iter([(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {bearer}"))?,
+        )]))
+        .build(env.relay_handle.http_url())?)
+}
+
+/// Auth settings for a relay that trusts `jwks_url` and has the dev hatch on.
+pub(super) fn token_auth(jwks_url: String, enforce_wallet_claim: bool) -> AuthConfig {
+    AuthConfig {
+        jwks_url,
+        dev_api_key: Some(TOKEN_DEV_KEY.to_string()),
+        dev_subject: None,
+        enforce_wallet_claim,
+    }
+}
+
+/// The relay's answer when a token does not list the address.
+pub(super) fn assert_not_in_token<T: std::fmt::Debug>(result: eyre::Result<T>) {
+    let err = result.expect_err("refused");
+    assert!(format!("{err:?}").contains("-32090"), "{err:?}");
+}
+
+/// A funded account on a relay that keys its quota by user.
+async fn token_account(
+    enforce: bool,
+    change: impl FnOnce(SponsorshipConfig) -> SponsorshipConfig,
+) -> eyre::Result<(Environment, KeyWith712Signer, ed25519_dalek::SigningKey)> {
+    let mut env = Environment::setup().await?;
+    let (signing, jwks_url) = serve_jwks().await?;
+    env.config.auth = Some(token_auth(jwks_url, enforce));
+    let sponsorship = change(SponsorshipConfig {
+        quota_key: QuotaKey::User,
+        quota_overrides: [("dev-local".to_string(), u128::MAX)].into(),
+        ..limited(&env, U256::from(u128::MAX), U256::MAX)
+    });
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+    Ok((env, key, signing))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_outside_the_token_is_refused() -> eyre::Result<()> {
+    let (env, key, signing) = token_account(true, |policy| policy).await?;
+    let wallets = serde_json::json!([format!("{:#x}", Address::random())]);
+    let client = client_with(&env, &token(&signing, Some(wallets)))?;
+
+    assert_not_in_token(prepare_through(&client, &env, &key).await);
+    assert_eq!(held_for(&env, "user-1").await?, U256::ZERO);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_without_a_valid_token_is_refused() -> eyre::Result<()> {
+    let (env, key, _) = token_account(true, |policy| SponsorshipConfig {
+        sponsor_all: true,
+        quota_key: QuotaKey::Address,
+        ..policy
+    })
+    .await?;
+
+    assert_not_in_token(prepare(&env, &key).await);
+
+    let (other_issuer, _) = serve_jwks().await?;
+    let wallets = serde_json::json!([format!("{:#x}", env.eoa.address())]);
+    let forged = client_with(&env, &token(&other_issuer, Some(wallets)))?;
+    assert_not_in_token(prepare_through(&forged, &env, &key).await);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_in_the_token_is_sponsored() -> eyre::Result<()> {
+    let (env, key, signing) = token_account(true, |policy| policy).await?;
+    let wallets = serde_json::json!([
+        format!("{:#x}", Address::random()),
+        format!("{:#x}", env.eoa.address())
+    ]);
+    let client = client_with(&env, &token(&signing, Some(wallets)))?;
+
+    assert!(charged(&prepare_through(&client, &env, &key).await?).is_zero());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_without_the_claim_is_refused() -> eyre::Result<()> {
+    let (env, key, signing) = token_account(true, |policy| policy).await?;
+    let client = client_with(&env, &token(&signing, None))?;
+
+    assert_not_in_token(prepare_through(&client, &env, &key).await);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_claim_is_refused() -> eyre::Result<()> {
+    let (env, key, signing) = token_account(true, |policy| policy).await?;
+    let client = client_with(&env, &token(&signing, Some(serde_json::json!([]))))?;
+
+    assert_not_in_token(prepare_through(&client, &env, &key).await);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_claim_is_ignored_with_the_check_off() -> eyre::Result<()> {
+    let (env, key, signing) = token_account(false, |policy| policy).await?;
+    for wallets in [Some(serde_json::json!([])), Some(serde_json::json!("not a list")), None] {
+        let client = client_with(&env, &token(&signing, wallets))?;
+        assert!(charged(&prepare_through(&client, &env, &key).await?).is_zero());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_dev_hatch_has_no_token_to_check() -> eyre::Result<()> {
+    let (env, key, _) = token_account(true, |policy| policy).await?;
+    let client = client_with(&env, TOKEN_DEV_KEY)?;
+
+    assert!(charged(&prepare_through(&client, &env, &key).await?).is_zero());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_the_user_pays_for_needs_no_address_in_the_token() -> eyre::Result<()> {
+    let (env, key, signing) = token_account(true, |policy| SponsorshipConfig {
+        sponsored_chains: Default::default(),
+        ..policy
+    })
+    .await?;
+    let client = client_with(&env, &token(&signing, Some(serde_json::json!([]))))?;
+
+    assert!(!charged(&prepare_through(&client, &env, &key).await?).is_zero());
     Ok(())
 }

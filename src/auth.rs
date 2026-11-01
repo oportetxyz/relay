@@ -20,6 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use alloy::primitives::Address;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, VerifyingKey};
 use futures::{FutureExt, future::BoxFuture};
@@ -82,6 +83,25 @@ struct JwtHeader {
 struct JwtPayload {
     sub: String,
     exp: i64,
+}
+
+#[derive(Deserialize)]
+struct WalletsClaim {
+    wallets: Vec<String>,
+}
+
+/// The addresses a request may be sponsored for, present only when
+/// `auth.enforce_wallet_claim` is on. Empty for a caller without a valid token, and absent for
+/// the dev hatch, which has no token to read.
+#[derive(Debug, Clone)]
+pub struct TokenWallets(pub Vec<String>);
+
+impl TokenWallets {
+    /// Whether the token lists `address`.
+    pub fn permits(&self, address: Address) -> bool {
+        let address = format!("{address:#x}");
+        self.0.iter().any(|wallet| wallet.eq_ignore_ascii_case(&address))
+    }
 }
 
 #[derive(Deserialize)]
@@ -203,13 +223,15 @@ fn bearer_token(headers: &http::HeaderMap) -> Option<&str> {
 pub struct JwtAuthLayer {
     cache: Option<JwksCache>,
     dev: Option<DevBypass>,
+    enforce_wallets: bool,
 }
 
 impl JwtAuthLayer {
     /// Build the layer. `cache` enables JWKS verification; `dev` enables the
-    /// local escape hatch. Both `None` = pass-through.
-    pub fn new(cache: Option<JwksCache>, dev: Option<DevBypass>) -> Self {
-        Self { cache, dev }
+    /// local escape hatch. Both `None` = pass-through. `enforce_wallets` exposes a token's
+    /// addresses as [`TokenWallets`].
+    pub fn new(cache: Option<JwksCache>, dev: Option<DevBypass>, enforce_wallets: bool) -> Self {
+        Self { cache, dev, enforce_wallets }
     }
 }
 
@@ -217,8 +239,25 @@ impl<S> Layer<S> for JwtAuthLayer {
     type Service = JwtAuthService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        JwtAuthService { inner, cache: self.cache.clone(), dev: self.dev.clone() }
+        JwtAuthService {
+            inner,
+            cache: self.cache.clone(),
+            dev: self.dev.clone(),
+            enforce_wallets: self.enforce_wallets,
+        }
     }
+}
+
+/// The `wallets` claim of an already verified token. Read apart from the rest of the payload so
+/// that it plays no part in verification. Empty when the claim is absent or malformed.
+fn wallets_claim(token: &str) -> Vec<String> {
+    token
+        .split('.')
+        .nth(1)
+        .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+        .and_then(|payload| serde_json::from_slice::<WalletsClaim>(&payload).ok())
+        .map(|claim| claim.wallets)
+        .unwrap_or_default()
 }
 
 /// The service produced by [`JwtAuthLayer`]; resolves the bearer credential (dev
@@ -228,6 +267,7 @@ pub struct JwtAuthService<S> {
     inner: S,
     cache: Option<JwksCache>,
     dev: Option<DevBypass>,
+    enforce_wallets: bool,
 }
 
 impl<S, B> Service<HttpRequest<B>> for JwtAuthService<S>
@@ -248,6 +288,7 @@ where
     fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
         let cache = self.cache.clone();
         let dev = self.dev.clone();
+        let enforce_wallets = self.enforce_wallets;
         // Call the ready clone; keep `self.inner` as the fresh clone so we never
         // call a service that wasn't polled ready.
         let clone = self.inner.clone();
@@ -258,6 +299,9 @@ where
         let token = bearer_token(request.headers()).map(str::to_owned);
 
         async move {
+            // why: with the check on, a request with no valid token lists nothing. Leaving it
+            // out would skip the check on chains that sponsor callers without a token.
+            let mut wallets = enforce_wallets.then(Vec::new);
             if let Some(token) = token {
                 if let Some(dev) = &dev
                     && ct_eq(token.as_bytes(), dev.api_key.as_bytes())
@@ -265,11 +309,16 @@ where
                     // Local dev escape hatch: static bearer, no JWKS round-trip.
                     debug!(subject = %dev.subject, "jwt: dev escape hatch accepted bearer");
                     request.extensions_mut().insert(VerifiedSub(dev.subject.clone()));
+                    wallets = None;
                 } else if let Some(cache) = &cache
                     && let Some(sub) = cache.verify(&token).await
                 {
                     request.extensions_mut().insert(VerifiedSub(sub));
+                    wallets = wallets.map(|_| wallets_claim(&token));
                 }
+            }
+            if let Some(wallets) = wallets {
+                request.extensions_mut().insert(TokenWallets(wallets));
             }
             inner.call(request).await.map_err(Into::into)
         }
@@ -337,6 +386,46 @@ mod tests {
         assert!(cache.verify(&token).await.is_none());
     }
 
+    /// A signed token with `wallets` as its claim.
+    fn jwt_with_wallets(sk: &SigningKey, wallets: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","kid":"kid-1"}"#);
+        let payload =
+            serde_json::json!({ "sub": "u", "exp": 32_503_680_000i64, "wallets": wallets });
+        let input = format!("{header}.{}", URL_SAFE_NO_PAD.encode(payload.to_string()));
+        let signature = sk.sign(input.as_bytes()).to_bytes();
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    #[tokio::test]
+    async fn a_malformed_claim_lists_nothing_and_still_verifies() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let cache = preloaded_cache("kid-1", sk.verifying_key()).await;
+        let deep = format!("{}{}", "[".repeat(300), "]".repeat(300));
+        let deep = serde_json::Value::String(deep);
+        for wallets in [serde_json::json!("0xabc"), serde_json::json!([1]), deep] {
+            let token = jwt_with_wallets(&sk, wallets);
+            assert!(cache.verify(&token).await.is_some());
+            assert!(wallets_claim(&token).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_claim_is_read_from_the_payload() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let token = jwt_with_wallets(&sk, serde_json::json!(["0xabc"]));
+        assert_eq!(wallets_claim(&token), ["0xabc"]);
+    }
+
+    #[test]
+    fn permits_compares_addresses_whatever_their_case() {
+        let address = Address::repeat_byte(0xab);
+        let upper = format!("0x{}", "AB".repeat(20));
+        assert!(TokenWallets(vec![format!("{address:#x}")]).permits(address));
+        assert!(TokenWallets(vec![upper]).permits(address));
+        assert!(!TokenWallets(vec![format!("{:#x}", Address::repeat_byte(1))]).permits(address));
+        assert!(!TokenWallets(vec![]).permits(address));
+    }
+
     #[test]
     fn ct_eq_matches_std_eq() {
         assert!(ct_eq(b"secret-token", b"secret-token"));
@@ -367,7 +456,7 @@ mod tests {
             }
         });
 
-        let mut svc = JwtAuthLayer::new(cache, dev).layer(inner);
+        let mut svc = JwtAuthLayer::new(cache, dev, false).layer(inner);
         let mut builder = HttpRequest::builder();
         if let Some(t) = bearer {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
