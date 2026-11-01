@@ -103,6 +103,12 @@ pub struct RelayTransaction {
     /// [`RelayTransaction::sponsored_account`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsored_for: Option<Address>,
+    /// Digest of the sponsorship hold this transaction settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsorship_hold: Option<B256>,
+    /// Most an internal transaction may pay per gas. An intent has its quote's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<u128>,
 }
 
 impl RelayTransaction {
@@ -123,6 +129,8 @@ impl RelayTransaction {
             received_at: Utc::now(),
             quota_subject: None,
             sponsored_for: None,
+            sponsorship_hold: None,
+            max_fee_per_gas: None,
         }
     }
 
@@ -143,6 +151,18 @@ impl RelayTransaction {
     /// Mark an internal transaction as sponsored for `account`.
     pub fn with_sponsored_for(mut self, account: Address) -> Self {
         self.sponsored_for = Some(account);
+        self
+    }
+
+    /// Set the most an internal tx may pay per gas.
+    pub fn with_max_fee_per_gas(mut self, max_fee_per_gas: u128) -> Self {
+        self.max_fee_per_gas = Some(max_fee_per_gas);
+        self
+    }
+
+    /// Set the sponsorship hold this tx settles.
+    pub fn with_sponsorship_hold(mut self, digest: Option<B256>) -> Self {
+        self.sponsorship_hold = digest;
         self
     }
 
@@ -193,6 +213,8 @@ impl RelayTransaction {
             received_at: Utc::now(),
             quota_subject: None,
             sponsored_for: None,
+            sponsorship_hold: None,
+            max_fee_per_gas: None,
         }
     }
 
@@ -299,7 +321,7 @@ impl RelayTransaction {
         if let RelayTransactionKind::Intent { quote, .. } = &self.kind {
             quote.native_fee_estimate.max_fee_per_gas
         } else {
-            u128::MAX
+            self.max_fee_per_gas.unwrap_or(u128::MAX)
         }
     }
 

@@ -28,7 +28,7 @@ use crate::{
     },
     types::{
         AssetDiffs, AssetUid, CreatableAccount, HistoricalPrice, HistoricalPriceKey, SignedCall,
-        SponsorshipUsage,
+        SponsorshipHold, SponsorshipUsage,
         rpc::{AuthenticatorAttachment, BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
@@ -2047,6 +2047,84 @@ impl StorageApi for PgStorage {
         .map_err(eyre::Error::from)?;
 
         Ok(())
+    }
+
+    async fn reserve_sponsorship(&self, holds: Vec<SponsorshipHold>) -> Result<bool> {
+        if holds.is_empty() {
+            return Ok(true);
+        }
+        let row = sqlx::query(
+            "SELECT reserve_sponsorship_holds($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) AS fits",
+        )
+        .bind(holds.iter().map(|hold| hold.digest.to_vec()).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| hold.chain_id as i64).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| hold.quota_subject.clone()).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| u256_to_numeric(hold.amount)).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| u256_to_numeric(hold.max_amount)).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| hold.claimed).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| hold.expires_at).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| u256_to_numeric(hold.quota_cap)).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| u256_to_numeric(hold.breaker_cap)).collect::<Vec<_>>())
+        .bind(holds.iter().map(|hold| hold.window_hours as i32).collect::<Vec<_>>())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(eyre::Error::from)?;
+
+        Ok(row.get("fits"))
+    }
+
+    async fn claim_sponsorship(&self, digest: B256, until: DateTime<Utc>) -> Result<bool> {
+        let claimed = sqlx::query(
+            r#"
+            UPDATE sponsorship_holds SET claimed = TRUE, expires_at = $2
+            WHERE digest = $1 AND NOT claimed AND expires_at > NOW()
+            "#,
+        )
+        .bind(digest.as_slice())
+        .bind(until)
+        .execute(&self.pool)
+        .await
+        .map_err(eyre::Error::from)?;
+
+        Ok(claimed.rows_affected() > 0)
+    }
+
+    async fn unclaim_sponsorship(&self, digest: B256, until: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "UPDATE sponsorship_holds SET claimed = FALSE, expires_at = $2 WHERE digest = $1",
+        )
+        .bind(digest.as_slice())
+        .bind(until)
+        .execute(&self.pool)
+        .await
+        .map_err(eyre::Error::from)?;
+        Ok(())
+    }
+
+    async fn release_sponsorship(&self, digest: B256, chain_id: ChainId) -> Result<()> {
+        sqlx::query("DELETE FROM sponsorship_holds WHERE digest = $1 AND chain_id = $2")
+            .bind(digest.as_slice())
+            .bind(chain_id as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(eyre::Error::from)?;
+        Ok(())
+    }
+
+    async fn held_sponsorship_wei(&self, quota_subject: &str, chain_id: ChainId) -> Result<U256> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(amount), 0) AS total FROM sponsorship_holds
+            WHERE quota_subject = $1 AND chain_id = $2 AND expires_at > NOW()
+            "#,
+        )
+        .bind(quota_subject)
+        .bind(chain_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(eyre::Error::from)?;
+
+        Ok(numeric_to_u256(&row.get::<BigDecimal, _>("total")))
     }
 
     async fn sponsored_wei_in_window(

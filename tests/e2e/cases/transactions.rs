@@ -13,6 +13,7 @@ use alloy::{
         coins_bip39::{English, Mnemonic},
     },
 };
+use chrono::{TimeDelta, Utc};
 use futures::stream::FuturesOrdered;
 use futures_util::{
     StreamExt, TryStreamExt,
@@ -24,6 +25,7 @@ use relay::{
     signers::DynSigner,
     storage::StorageApi,
     transactions::{MIN_SIGNER_GAS, RelayTransactionKind, TransactionService, TransactionStatus},
+    types::SponsorshipHold,
 };
 use std::{collections::HashSet, time::Duration};
 use tokio::sync::broadcast;
@@ -796,5 +798,55 @@ async fn send_raw_transaction_sync() -> eyre::Result<()> {
     let tx = account.prepare_tx(&env).await;
     assert_confirmed(tx_service_handle.send_transaction(tx).await?).await;
 
+    Ok(())
+}
+
+/// A sent transaction that the relay stops tracking may still have landed, so its hold stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_broadcast_keeps_its_hold() -> eyre::Result<()> {
+    let env = Environment::setup_with_config(EnvironmentConfig {
+        block_time: Some(1.0),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let tx_service_handle =
+        env.relay_handle.chains.get(env.chain_id()).unwrap().transactions().clone();
+    let account = MockAccount::new(&env).await.unwrap();
+
+    let digest = B256::random();
+    let amount = U256::from(100);
+    let reserved = env
+        .relay_handle
+        .storage
+        .reserve_sponsorship(vec![SponsorshipHold {
+            digest,
+            chain_id: env.chain_id(),
+            quota_subject: "subject".to_string(),
+            amount,
+            max_amount: amount,
+            expires_at: Utc::now() + TimeDelta::hours(1),
+            claimed: true,
+            quota_cap: U256::MAX,
+            breaker_cap: U256::MAX,
+            window_hours: 24,
+        }])
+        .await?;
+    assert!(reserved);
+
+    env.disable_mining().await;
+    let tx = account.prepare_tx(&env).await.with_sponsorship_hold(Some(digest));
+    let mut events = tx_service_handle.send_transaction(tx.clone()).await?;
+    let hash = wait_for_tx_hash(&mut events).await;
+    env.drop_transaction(hash).await.unwrap();
+
+    let max_fee = tx.quote().unwrap().native_fee_estimate.max_fee_per_gas;
+    env.provider().anvil_set_next_block_base_fee_per_gas(max_fee * 2).await.unwrap();
+    env.mine_block().await;
+    env.enable_mining().await;
+    assert_failed(events, "transaction underpriced").await;
+
+    let held = env.relay_handle.storage.held_sponsorship_wei("subject", env.chain_id()).await?;
+    assert_eq!(held, amount);
     Ok(())
 }

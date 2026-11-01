@@ -12,7 +12,7 @@ use crate::{
     },
     types::{
         AssetDiffs, CreatableAccount, HistoricalPrice, HistoricalPriceKey, Quote, SignedCall,
-        SponsorshipUsage,
+        SponsorshipHold, SponsorshipUsage,
         rpc::{BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
@@ -454,6 +454,25 @@ pub trait StorageApi: Debug + Send + Sync {
 
     /// Records a sponsored transaction into the usage ledger.
     async fn record_sponsorship_usage(&self, usage: SponsorshipUsage) -> Result<()>;
+
+    /// Stores every hold, or none of them unless each fits its limits on top of what the
+    /// ledger and the live holds already count. Decides atomically, so concurrent callers
+    /// cannot share the same room. A digest already held stays as it is.
+    async fn reserve_sponsorship(&self, holds: Vec<SponsorshipHold>) -> Result<bool>;
+
+    /// Marks a live, unclaimed quote's holds as sent, keeping them until `until`. Returns
+    /// false when there is nothing to claim: the quote was sent before, or its hold expired.
+    async fn claim_sponsorship(&self, digest: B256, until: DateTime<Utc>) -> Result<bool>;
+
+    /// Makes a quote's holds claimable again until `until`, for a send that failed before
+    /// anything went out.
+    async fn unclaim_sponsorship(&self, digest: B256, until: DateTime<Utc>) -> Result<()>;
+
+    /// Drops a hold. Safe to repeat.
+    async fn release_sponsorship(&self, digest: B256, chain_id: ChainId) -> Result<()>;
+
+    /// Total of a quota subject's live holds on a chain (wei).
+    async fn held_sponsorship_wei(&self, quota_subject: &str, chain_id: ChainId) -> Result<U256>;
 
     /// Total sponsored spend (wei) for a quota subject on a chain within the last
     /// `window_hours`. Drives the per-user rolling quota.

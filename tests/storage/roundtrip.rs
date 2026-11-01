@@ -210,6 +210,7 @@ impl Fixtures {
             orchestrator: r_address,
             fee_token_deficit: r_u256,
             asset_deficits: Default::default(),
+            expected_cost: U256::ZERO,
         };
         let queued_id = B256::with_last_byte(1);
         let queued_tx = RelayTransaction {
@@ -223,6 +224,8 @@ impl Fixtures {
             received_at: Utc::now(),
             quota_subject: None,
             sponsored_for: Some(Address::random()),
+            sponsorship_hold: Some(B256::random()),
+            max_fee_per_gas: Some(7),
         };
 
         let pending_id = B256::with_last_byte(2);

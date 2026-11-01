@@ -118,9 +118,9 @@ chain_sponsorship:
   # empty and every sponsored call would start failing outright. 0.005 ETH/day
   # breaker keeps ~half the balance in reserve.
   # At 0.05 gwei a ~300k-gas intent costs ~1.5e-5 ETH, so 0.001 ETH/user/day is
-  # dozens of intents. At 5 gwei it is one, and above ~15 gwei the per-user cap
-  # denies the first call. That is deliberate - it fails closed on a gas spike
-  # rather than draining the funder. Raise both together with the balance.
+  # dozens of intents. A quote holds its maximum cost until it lands, so above
+  # ~3 gwei max fee the per-user cap denies the first call. That is deliberate -
+  # it fails closed on a gas spike rather than draining the funder. Raise both together with the balance.
   1:
     per_user_wei: "1000000000000000"
     circuit_breaker_wei: "5000000000000000"
@@ -160,6 +160,8 @@ pricefeed:
 
 auth:
   jwks_url: "https://onramp.xyz/api/auth/jwks"
+  # Stays off here. Only for local or dev runs whose JWKS points at a local app.
+  enforce_wallet_claim: false
 
 # Passkey association files, served at https://id.oportet.xyz/.well-known/ so
 # that host can become the app's WebAuthn rpId. Each entry lets an app use the

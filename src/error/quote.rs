@@ -14,6 +14,9 @@ pub enum QuoteError {
     /// The quote has deficits.
     #[error("quote has asset deficits and is expected to fail")]
     QuoteHasDeficits,
+    /// The sponsored quote was sent before, or its hold has lapsed.
+    #[error("sponsored quote already sent or expired")]
+    QuoteAlreadySent,
     /// The provided quote was not signed by the relay.
     #[error("invalid quote signer")]
     InvalidQuoteSignature,
@@ -75,6 +78,7 @@ impl From<QuoteError> for jsonrpsee::types::error::ErrorObject<'static> {
             | QuoteError::InvalidFeeAmount { .. }
             | QuoteError::MissingRequiredFunds
             | QuoteError::QuoteHasDeficits
+            | QuoteError::QuoteAlreadySent
             | QuoteError::InsufficientFeePayerBalance(..)
             | QuoteError::MultichainDisabled => invalid_params(err.to_string()),
             QuoteError::UnavailablePrice(..)

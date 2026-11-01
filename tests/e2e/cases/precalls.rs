@@ -8,16 +8,20 @@
 use crate::e2e::{
     AuthKind,
     cases::{
-        sponsorship::{REVERTS, assert_booked, booked, latest_transaction, wait_for_mempool},
+        sponsorship::{
+            REVERTS, TOKEN_DEV_KEY, assert_booked, assert_not_in_token, booked, client_with,
+            latest_transaction, serve_jwks, token, token_auth, wait_for_mempool,
+        },
         upgrade_account_eagerly, upgrade_account_lazily,
     },
     environment::Environment,
     send_prepared_calls,
 };
 use alloy::{
-    primitives::{B256, U256},
+    primitives::{Address, B256, U256},
     providers::ext::AnvilApi,
 };
+use jsonrpsee::http_client::HttpClientBuilder;
 use relay::{
     rpc::RelayApiClient,
     signers::Eip712PayLoadSigner,
@@ -249,6 +253,52 @@ async fn refuses_to_land_when_not_sponsored() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A stored grant is sponsored without a quote, so nothing else holds its cost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_landing_is_held_like_a_quote() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let admin = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    let recovery = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[admin.to_authorized()], &admin, AuthKind::Auth).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+
+    let policy = SponsorshipConfig {
+        sponsored_chains: [env.chain_id()].into(),
+        whitelisted_contracts: [env.eoa.address(), alloy::primitives::Address::ZERO]
+            .into_iter()
+            .collect(),
+        per_user_wei: U256::MAX,
+        circuit_breaker_wei: U256::MAX,
+        ..Default::default()
+    };
+    let base = env.config.clone();
+    let under = |sponsorship: SponsorshipConfig| {
+        let mut config = base.clone();
+        config.sponsorship = sponsorship;
+        config
+    };
+
+    let over_the_gas_cap = SponsorshipConfig { max_gas_per_tx: 21_000, ..policy.clone() };
+    env.restart_relay(under(over_the_gas_cap)).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+    assert!(execute(&env).await.is_err_and(|err| err.to_string().contains("not sponsor")));
+
+    let over_the_quota = SponsorshipConfig { per_user_wei: U256::ONE, ..policy.clone() };
+    env.restart_relay(under(over_the_quota)).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+    assert!(execute(&env).await.is_err_and(|err| err.to_string().contains("not sponsor")));
+
+    env.restart_relay(under(policy)).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+    execute(&env).await?;
+    assert_recovery_key_on_chain(&env, &recovery, true).await;
+
+    let subject = env.eoa.address().to_string();
+    let held = env.relay_handle.storage.held_sponsorship_wei(&subject, env.chain_id());
+    assert_eq!(held.await?, U256::ZERO);
+    Ok(())
+}
+
 /// What the multichain nonce buys: one signature, stored on every chain, landed
 /// on every chain, with no per-chain ceremony.
 #[tokio::test(flavor = "multi_thread")]
@@ -291,5 +341,40 @@ async fn one_signature_lands_on_every_chain() -> eyre::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_landing_needs_the_address_in_the_token() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let (signing, jwks_url) = serve_jwks().await?;
+    env.config.auth = Some(token_auth(jwks_url, true));
+    let mut config = env.config.clone();
+    config.sponsorship = SponsorshipConfig {
+        sponsor_all: true,
+        quota_overrides: [("dev-local".to_string(), u128::MAX)].into(),
+        ..Default::default()
+    };
+    env.restart_relay(config).await?;
+    // why: the setup sends no token of its own, which this relay refuses.
+    let without_token = HttpClientBuilder::default().build(env.relay_handle.http_url())?;
+    env.relay_endpoint = client_with(&env, TOKEN_DEV_KEY)?;
+
+    let admin = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    let recovery = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[admin.to_authorized()], &admin, AuthKind::Auth).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+
+    let parameters =
+        || ExecutePreCallsParameters { address: env.eoa.address(), chain_id: env.chain_id() };
+    assert_not_in_token(without_token.execute_pre_calls(parameters()).await.map_err(Into::into));
+
+    let outside = serde_json::json!([format!("{:#x}", Address::random())]);
+    let client = client_with(&env, &token(&signing, Some(outside)))?;
+    assert_not_in_token(client.execute_pre_calls(parameters()).await.map_err(Into::into));
+
+    let listed = serde_json::json!([format!("{:#x}", env.eoa.address())]);
+    let client = client_with(&env, &token(&signing, Some(listed)))?;
+    assert!(!client.execute_pre_calls(parameters()).await?.nonces.is_empty());
     Ok(())
 }

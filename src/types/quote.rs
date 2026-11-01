@@ -203,6 +203,12 @@ pub struct Quote {
     /// Assets user is missing for the intent to execute correctly.
     #[serde(default, skip_serializing_if = "AssetDeficits::is_empty")]
     pub asset_deficits: AssetDeficits,
+    /// What the transaction should cost the relay (wei) if it sponsors it.
+    ///
+    /// Read once, while the quote is being held, by the relay that built it. It is neither
+    /// signed nor sent, so a quote means the same to the client and hashes the same.
+    #[serde(skip)]
+    pub expected_cost: U256,
 }
 
 impl Quote {
@@ -226,6 +232,7 @@ impl Quote {
             orchestrator,
             fee_token_deficit,
             asset_deficits,
+            expected_cost: _,
         } = self;
 
         let mut hasher = Keccak256::new();
@@ -291,6 +298,7 @@ mod tests {
             orchestrator: Address::ZERO,
             fee_token_deficit: U256::ZERO,
             asset_deficits: AssetDeficits::default(),
+            expected_cost: U256::ZERO,
         };
 
         test_field!(base_quote, chain_id, 2, "chain_id must affect digest");
@@ -348,6 +356,17 @@ mod tests {
     }
 
     /// A quote with every field fixed, so its digest can be pinned.
+    // A client hands the quote back and the relay checks it against the digest it signed, so
+    // the expected cost has to be invisible to both.
+    #[test]
+    fn the_expected_cost_is_neither_signed_nor_sent() {
+        let quote = fixed_quote(1);
+        let held = Quote { expected_cost: U256::from(7), ..quote.clone() };
+
+        assert_eq!(quote.digest(), held.digest());
+        assert_eq!(serde_json::to_value(&quote).unwrap(), serde_json::to_value(&held).unwrap());
+    }
+
     fn fixed_quote(payment: u64) -> Quote {
         Quote {
             chain_id: 8453,
@@ -368,6 +387,7 @@ mod tests {
             orchestrator: Address::repeat_byte(2),
             fee_token_deficit: U256::ZERO,
             asset_deficits: AssetDeficits::default(),
+            expected_cost: U256::ZERO,
         }
     }
 
