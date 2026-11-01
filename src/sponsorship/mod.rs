@@ -308,6 +308,17 @@ mod tests {
 
     // (c) the global circuit breaker trips once total sponsored spend across ALL
     // subjects reaches the ceiling, even for a subject with fresh personal quota.
+    /// A booking replayed after a restart counts once, as the Postgres unique key makes it.
+    #[tokio::test]
+    async fn a_repeated_booking_counts_once() {
+        let storage = RelayStorage::in_memory();
+        seed(&storage, "subject", CHAIN, U256::from(5)).await;
+        seed(&storage, "subject", CHAIN, U256::from(5)).await;
+
+        let total = storage.sponsored_wei_in_window("subject", CHAIN, 24).await.unwrap();
+        assert_eq!(total, U256::from(5));
+    }
+
     #[tokio::test]
     async fn global_breaker_trips() {
         let (eval, storage) = evaluator(user_mode_cfg());

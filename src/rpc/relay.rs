@@ -19,7 +19,7 @@ use crate::{
         Key, MULTICHAIN_NONCE_PREFIX, MerkleLeafInfo,
         OrchestratorContract::{self, IntentExecuted},
         Quotes, SignedCall, SignedCalls, SourcedAsset, SponsorshipQuotaParameters,
-        SponsorshipQuotaResponse, SponsorshipUsage, Transfer, VersionedContracts,
+        SponsorshipQuotaResponse, Transfer, VersionedContracts,
         rpc::{
             AddFaucetFundsParameters, AddFaucetFundsResponse, AddressOrNative, Asset7811,
             AssetFilterItem, CallHistoryCapabilities, CallHistoryEntry, CallHistoryTransaction,
@@ -3971,7 +3971,8 @@ impl RelayApiServer for Relay {
             gas_limit,
         )
         .with_authorization_list(authorization_list)
-        .with_quota_subject(quota_subject.clone());
+        .with_quota_subject(quota_subject)
+        .with_sponsored_for(eoa);
 
         let handle = chain.transactions().clone();
         handle.send_transaction(tx.clone()).await.map_err(RelayError::from)?;
@@ -3995,25 +3996,6 @@ impl RelayApiServer for Relay {
                 .into());
             }
         };
-
-        // The signer's confirmed-metrics recorder only books intents, so this
-        // relay-paid transaction is booked against the same ledger here.
-        if let Some(quota_subject) = quota_subject {
-            let gas_used = U256::from(receipt.gas_used);
-            let gas_price = U256::from(receipt.effective_gas_price);
-            self.inner
-                .storage
-                .record_sponsorship_usage(SponsorshipUsage {
-                    user_address: eoa,
-                    quota_subject,
-                    chain_id,
-                    tx_hash: receipt.transaction_hash.to_string(),
-                    gas_used,
-                    gas_price,
-                    eth_spent: gas_used * gas_price,
-                })
-                .await?;
-        }
 
         for nonce in &nonces {
             self.inner.storage.remove_precall(chain_id, eoa, *nonce).await?;

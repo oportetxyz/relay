@@ -88,6 +88,7 @@ impl BundleWithStatusAndTime {
 /// In-memory sponsored-usage record (test backend only).
 #[derive(Debug, Clone)]
 struct InMemSponsorshipUsage {
+    tx_hash: String,
     quota_subject: String,
     chain_id: ChainId,
     eth_spent: U256,
@@ -972,7 +973,13 @@ impl StorageApi for InMemoryStorage {
     }
 
     async fn record_sponsorship_usage(&self, usage: SponsorshipUsage) -> Result<()> {
-        self.sponsorship_usage.write().await.push(InMemSponsorshipUsage {
+        let mut ledger = self.sponsorship_usage.write().await;
+        // why: same as the unique `tx_hash` in Postgres, a booking can be repeated after a restart.
+        if ledger.iter().any(|entry| entry.tx_hash == usage.tx_hash) {
+            return Ok(());
+        }
+        ledger.push(InMemSponsorshipUsage {
+            tx_hash: usage.tx_hash,
             quota_subject: usage.quota_subject,
             chain_id: usage.chain_id,
             eth_spent: usage.eth_spent,

@@ -294,6 +294,10 @@ impl Signer {
         tx: PendingTransaction,
         receipt: TransactionReceipt,
     ) -> Result<(), StorageError> {
+        // why: first, so that a failed write or a restart leaves the pending row in place and the
+        // receipt is booked when it is watched again. The ledger drops repeats by hash.
+        self.book_sponsored_spend(&tx.tx, &receipt).await?;
+
         self.update_tx_status(tx.id(), TransactionStatus::Confirmed(Box::new(receipt.clone())))
             .await?;
         self.storage.remove_pending_transaction(tx.id()).await?;
@@ -876,6 +880,36 @@ impl Signer {
         Ok(())
     }
 
+    /// Books what a landed transaction cost against the sponsorship ledger, feeding the
+    /// per-subject quota and the global circuit breaker.
+    ///
+    /// The relay paid for the transaction whatever it did on chain, so the outcome plays no part
+    /// here. The quota subject was resolved at send time per the chain's policy (address or
+    /// verified user); fall back to the address for legacy txs with no stored subject.
+    async fn book_sponsored_spend(
+        &self,
+        tx: &RelayTransaction,
+        receipt: &TransactionReceipt,
+    ) -> Result<(), StorageError> {
+        let Some(eoa) = tx.sponsored_account() else {
+            return Ok(());
+        };
+
+        let gas_used = U256::from(receipt.gas_used);
+        let gas_price = U256::from(receipt.effective_gas_price);
+        self.storage
+            .record_sponsorship_usage(SponsorshipUsage {
+                user_address: eoa,
+                quota_subject: tx.quota_subject.clone().unwrap_or_else(|| eoa.to_string()),
+                chain_id: self.chain_id,
+                tx_hash: receipt.transaction_hash.to_string(),
+                gas_used,
+                gas_price,
+                eth_spent: gas_used * gas_price,
+            })
+            .await
+    }
+
     /// Fetches receipt of a confirmed transaction and records metrics.
     async fn record_confirmed_metrics(&self, tx: PendingTransaction, receipt: TransactionReceipt) {
         if !tx.tx.is_intent() {
@@ -905,34 +939,6 @@ impl Signer {
             warn!(%tx_hash, err = %event.err, signer = %self.address(), chain_id = %self.chain_id, "intent failed on-chain");
             self.metrics.failed_intents.increment(1);
             return;
-        }
-
-        // Record sponsored gas usage: a zero-payment intent means the relay funder
-        // covered the on-chain gas (see rpc::relay build_quotes). Feed the per-subject
-        // quota + global circuit breaker. ponytail: zero-payment also holds for an
-        // external fee_payer, which we don't expose to clients, so it currently marks
-        // our own sponsorship. The quota subject was resolved at send time per the
-        // chain's policy (address or verified user); fall back to the address for
-        // legacy txs with no stored subject.
-        if let RelayTransactionKind::Intent { quote, .. } = &tx.tx.kind
-            && quote.intent.total_payment_max_amount().is_zero()
-        {
-            let eoa = *quote.intent.eoa();
-            let quota_subject = tx.tx.quota_subject.clone().unwrap_or_else(|| eoa.to_string());
-            let gas_used = U256::from(receipt.gas_used);
-            let gas_price = U256::from(receipt.effective_gas_price);
-            let usage = SponsorshipUsage {
-                user_address: eoa,
-                quota_subject,
-                chain_id: self.chain_id,
-                tx_hash: tx_hash.to_string(),
-                gas_used,
-                gas_price,
-                eth_spent: gas_used * gas_price,
-            };
-            if let Err(e) = self.storage.record_sponsorship_usage(usage).await {
-                warn!(%tx_hash, error = %e, "failed to record sponsorship usage");
-            }
         }
 
         // The inclusion time comes from the receipt's logs when the node sets `blockTimestamp`, so
