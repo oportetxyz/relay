@@ -278,3 +278,86 @@ async fn populate_historical_prices(env: &Environment, _bundle_ids: &[BundleId])
 
     Ok(())
 }
+
+/// An account with `sends` bundles of its own on top of its initialization bundle, returned oldest
+/// first.
+async fn account_with_bundles(
+    env: &Environment,
+    sends: usize,
+) -> Result<(MockAccount, Vec<BundleId>)> {
+    let account = MockAccountBuilder::new().build(env).await?;
+    let mut bundles = get_history(env, account.address, None, 100, SortDirection::Asc)
+        .await?
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    assert_eq!(bundles.len(), 1, "the initialization bundle");
+
+    for _ in 0..sends {
+        // Bundles are ordered by time, so each one needs a timestamp of its own.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        bundles.push(send_bundle(env, &account, 0, U256::from(1), env.erc20).await?);
+    }
+
+    Ok((account, bundles))
+}
+
+fn ids_and_indexes(entries: &[CallHistoryEntry]) -> Vec<(BundleId, u64)> {
+    entries.iter().map(|entry| (entry.id, entry.index)).collect()
+}
+
+/// The app reads its activity this way, and a page that started at the oldest bundle hid every
+/// bundle newer than it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newest_first_read_with_no_index_starts_at_the_newest() -> Result<()> {
+    let env = Environment::setup().await?;
+    let (account, bundles) = account_with_bundles(&env, 4).await?;
+    let [init, first, second, third, fourth] = bundles[..] else { unreachable!() };
+
+    let page = get_history(&env, account.address, None, 2, SortDirection::Desc).await?;
+    assert_eq!(ids_and_indexes(&page), [(fourth, 0), (third, 1)]);
+
+    let whole = get_history(&env, account.address, None, 5, SortDirection::Desc).await?;
+    assert_eq!(
+        ids_and_indexes(&whole),
+        [(fourth, 0), (third, 1), (second, 2), (first, 3), (init, 4)],
+        "a limit equal to the account's bundles returns all of them"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newest_first_read_under_the_limit_returns_everything() -> Result<()> {
+    let env = Environment::setup().await?;
+    let (account, bundles) = account_with_bundles(&env, 2).await?;
+    let [init, first, second] = bundles[..] else { unreachable!() };
+
+    let history = get_history(&env, account.address, None, 20, SortDirection::Desc).await?;
+    assert_eq!(ids_and_indexes(&history), [(second, 0), (first, 1), (init, 2)]);
+
+    Ok(())
+}
+
+/// Readers page through history with these, the server's vault basis among them.
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_with_an_index_or_oldest_first_keep_their_pages() -> Result<()> {
+    let env = Environment::setup().await?;
+    let (account, bundles) = account_with_bundles(&env, 3).await?;
+    let [init, first, second, third] = bundles[..] else { unreachable!() };
+    let address = account.address;
+
+    let desc = get_history(&env, address, Some(0), 2, SortDirection::Desc).await?;
+    assert_eq!(ids_and_indexes(&desc), [(third, 0), (second, 1)]);
+    let desc = get_history(&env, address, Some(2), 2, SortDirection::Desc).await?;
+    assert_eq!(ids_and_indexes(&desc), [(first, 2), (init, 3)]);
+    assert!(get_history(&env, address, Some(4), 2, SortDirection::Desc).await?.is_empty());
+
+    let asc = get_history(&env, address, None, 2, SortDirection::Asc).await?;
+    assert_eq!(ids_and_indexes(&asc), [(init, 0), (first, 1)]);
+    let asc = get_history(&env, address, Some(2), 2, SortDirection::Asc).await?;
+    assert_eq!(ids_and_indexes(&asc), [(second, 2), (third, 3)]);
+    assert!(get_history(&env, address, Some(4), 2, SortDirection::Asc).await?.is_empty());
+
+    Ok(())
+}
