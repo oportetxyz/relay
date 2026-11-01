@@ -8,9 +8,10 @@
 use std::{collections::HashMap, fmt};
 
 use alloy::primitives::{
-    Address, ChainId, FixedBytes, U256,
+    Address, B256, ChainId, FixedBytes, U256,
     map::{HashMap as AHashMap, HashSet},
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// What the per-user rolling quota counts against.
@@ -73,6 +74,13 @@ pub struct SponsorshipConfig {
     /// escape-hatch subject — tighter (or looser) than a normal user.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub quota_overrides: HashMap<String, u128>,
+    /// Most gas one sponsored transaction may use. A bigger transaction is not sponsored.
+    #[serde(default = "default_max_gas_per_tx")]
+    pub max_gas_per_tx: u64,
+}
+
+const fn default_max_gas_per_tx() -> u64 {
+    3_000_000
 }
 
 impl Default for SponsorshipConfig {
@@ -90,6 +98,7 @@ impl Default for SponsorshipConfig {
             quota_key: QuotaKey::Address,
             verified_skips_target_guard: false,
             quota_overrides: HashMap::new(),
+            max_gas_per_tx: default_max_gas_per_tx(),
         }
     }
 }
@@ -122,6 +131,9 @@ pub struct ChainSponsorshipConfig {
     /// Override for [`SponsorshipConfig::verified_skips_target_guard`].
     #[serde(default)]
     pub verified_skips_target_guard: Option<bool>,
+    /// Override for [`SponsorshipConfig::max_gas_per_tx`].
+    #[serde(default)]
+    pub max_gas_per_tx: Option<u64>,
 }
 
 impl SponsorshipConfig {
@@ -157,6 +169,7 @@ impl SponsorshipConfig {
                 .unwrap_or(self.verified_skips_target_guard),
             // Per-subject overrides are relay-global, not per-chain overridable.
             quota_overrides: self.quota_overrides.clone(),
+            max_gas_per_tx: o.max_gas_per_tx.unwrap_or(self.max_gas_per_tx),
         }
     }
 }
@@ -237,6 +250,64 @@ impl fmt::Debug for QuotaSubject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("QuotaSubject(..)")
     }
+}
+
+/// Percent of the simulated cost an expected cost carries, for a fee that moves before landing.
+const EXPECTED_COST_MARGIN_PERCENT: u64 = 125;
+
+/// What a transaction should cost the relay (wei), from its simulated gas and the current fee.
+pub fn expected_sponsored_cost(gas: u64, fee_per_gas: u128) -> U256 {
+    U256::from(gas).saturating_mul(U256::from(fee_per_gas))
+        * U256::from(EXPECTED_COST_MARGIN_PERCENT)
+        / U256::from(100)
+}
+
+/// One transaction a sponsorship hold covers.
+#[derive(Debug, Clone, Copy)]
+pub struct SponsoredCost {
+    /// Chain the transaction will land on.
+    pub chain_id: ChainId,
+    /// Gas limit of the transaction.
+    pub gas_limit: u64,
+    /// Highest fee per gas the signer may pay.
+    pub max_fee_per_gas: u128,
+    /// What the transaction should cost (wei). A hold never counts more than the maximum.
+    pub expected: U256,
+}
+
+impl SponsoredCost {
+    /// The most the transaction can cost (wei).
+    pub fn maximum(&self) -> U256 {
+        U256::from(self.gas_limit).saturating_mul(U256::from(self.max_fee_per_gas))
+    }
+}
+
+/// What one sponsored transaction may still cost, held against the limits it would spend
+/// under until it settles.
+#[derive(Debug, Clone)]
+pub struct SponsorshipHold {
+    /// The signed quote's digest, or the transaction id when no quote exists.
+    pub digest: B256,
+    /// Chain the transaction will land on.
+    pub chain_id: ChainId,
+    /// The identity the per-user quota counts against.
+    pub quota_subject: String,
+    /// What the transaction should cost (wei), which the quota counts so that quotes a user
+    /// abandons or retries do not spend it several times over.
+    pub amount: U256,
+    /// The most the transaction can cost (wei), which the breaker counts so that everything
+    /// held can land at its maximum without passing it.
+    pub max_amount: U256,
+    /// When the hold stops counting.
+    pub expires_at: DateTime<Utc>,
+    /// Whether the transaction has been sent already, so the hold cannot be claimed.
+    pub claimed: bool,
+    /// The subject's ceiling over the window (wei).
+    pub quota_cap: U256,
+    /// The chain's ceiling over the window (wei).
+    pub breaker_cap: U256,
+    /// Rolling window both ceilings apply to (hours).
+    pub window_hours: u64,
 }
 
 /// One sponsored transaction, recorded post-receipt.

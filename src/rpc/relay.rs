@@ -18,8 +18,9 @@ use crate::{
         FundingIntentContext, GasEstimate, Health, IERC20, IEscrow, IntentKey, IntentKind, Intents,
         Key, MULTICHAIN_NONCE_PREFIX, MerkleLeafInfo,
         OrchestratorContract::{self, IntentExecuted},
-        QuotaSubject, Quotes, SignedCall, SignedCalls, SourcedAsset, SponsorshipQuotaParameters,
-        SponsorshipQuotaResponse, Transfer, VersionedContracts,
+        QuotaSubject, Quotes, SignedCall, SignedCalls, SourcedAsset, SponsoredCost,
+        SponsorshipQuotaParameters, SponsorshipQuotaResponse, Transfer, VersionedContracts,
+        expected_sponsored_cost,
         rpc::{
             AddFaucetFundsParameters, AddFaucetFundsResponse, AddressOrNative, Asset7811,
             AssetFilterItem, CallHistoryCapabilities, CallHistoryEntry, CallHistoryTransaction,
@@ -49,6 +50,7 @@ use alloy::{
     sol_types::{SolCall, SolValue},
 };
 use alloy_chains::NamedChain;
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::{StreamExt, future::join_all, stream::FuturesOrdered};
 use futures_util::{TryStreamExt, future::try_join_all, join, stream::FuturesUnordered};
 use itertools::Itertools;
@@ -92,6 +94,14 @@ use crate::{
         },
     },
 };
+
+/// How long a sent transaction's sponsorship hold lasts if its settlement never comes.
+const SENT_SPONSORSHIP_HOLD: TimeDelta = TimeDelta::hours(1);
+
+/// How long a quote's sponsorship hold outlives the quote. The quote's TTL is what ends a send:
+/// a request that passed that check must still find its hold, however little of the TTL was
+/// left and whatever the database's clock says.
+const SPONSORSHIP_HOLD_MARGIN: TimeDelta = TimeDelta::seconds(5);
 
 /// Ithaca `relay_` RPC namespace.
 #[rpc(server, client, namespace = "wallet")]
@@ -746,6 +756,13 @@ impl Relay {
             }
         }
 
+        let expected_cost = expected_sponsored_cost(
+            gas_results.gUsed.saturating_to::<u64>() + intrinsic_gas + extra_fee_info.extra_gas(),
+            (fee_history.latest_block_base_fee().unwrap_or_default()
+                + native_fee_estimate.max_priority_fee_per_gas)
+                .min(native_fee_estimate.max_fee_per_gas),
+        );
+
         let quote = Quote {
             chain_id,
             payment_token_decimals: token.decimals,
@@ -762,6 +779,7 @@ impl Relay {
             orchestrator: *orchestrator.address(),
             fee_token_deficit,
             asset_deficits,
+            expected_cost,
         };
 
         // Create ChainAssetDiffs with populated fiat values including fee
@@ -803,12 +821,49 @@ impl Relay {
 
         let bundle_id = BundleId(*quotes.hash());
 
-        // Use multichain workflow if there's a merkle root OR a fee_payer quote
-        if quotes.ty().multi_chain_root.is_none() && quotes.ty().fee_payer_quote.is_none() {
-            self.send_single_chain_intent(&quotes, capabilities, signature, bundle_id).await
-        } else {
-            self.send_multichain_intents(quotes, capabilities, signature, bundle_id).await
+        // A quote with a subject was held at prepare. Claiming the hold is what lets it through,
+        // once: the holds bound what quotes can cost, which only works if each spends one.
+        let hold = quotes.ty().quota_subject.is_some().then(|| quotes.ty().digest());
+        if let Some(digest) = hold
+            && !self
+                .inner
+                .storage
+                .claim_sponsorship(digest, Utc::now() + SENT_SPONSORSHIP_HOLD)
+                .await
+                .map_err(RelayError::from)?
+        {
+            // why: a transport retries a send whose answer it lost, and that send went out. The
+            // bundle id is all it needs; nothing is sent again.
+            let storage = &self.inner.storage;
+            if !storage.get_bundle_transactions(bundle_id).await?.is_empty()
+                || storage.get_interop_status(bundle_id).await?.is_some()
+            {
+                return Ok(bundle_id);
+            }
+            return Err(QuoteError::QuoteAlreadySent.into());
         }
+        let ttl = quotes.ty().ttl;
+
+        // Use multichain workflow if there's a merkle root OR a fee_payer quote
+        let sent =
+            if quotes.ty().multi_chain_root.is_none() && quotes.ty().fee_payer_quote.is_none() {
+                self.send_single_chain_intent(&quotes, capabilities, signature, bundle_id).await
+            } else {
+                self.send_multichain_intents(quotes, capabilities, signature, bundle_id).await
+            };
+
+        if sent.is_err()
+            && let Some(digest) = hold
+        {
+            // why: nothing went out, so the same signed quote may still be sent, which is what
+            // a transport retry does. Dropping the hold would turn that into "already sent".
+            self.inner
+                .storage
+                .unclaim_sponsorship(digest, DateTime::<Utc>::from(ttl) + SPONSORSHIP_HOLD_MARGIN)
+                .await
+                .map_err(RelayError::from)?;
+        }
+        sent
     }
 
     #[instrument(skip_all)]
@@ -819,7 +874,7 @@ impl Relay {
         role: QuoteRole,
         capabilities: SendPreparedCallsCapabilities,
         signature: Bytes,
-        quota_subject: Option<QuotaSubject>,
+        sponsorship: Option<(QuotaSubject, B256)>,
     ) -> RpcResult<RelayTransaction> {
         role.check(&quote)?;
 
@@ -923,9 +978,10 @@ impl Relay {
 
         // A quote the user pays for counts against nobody, even in a bundle with one that is
         // sponsored.
-        let quota_subject =
-            quota_subject.filter(|_| quote.intent.total_payment_max_amount().is_zero());
+        let (quota_subject, sponsorship_hold) =
+            sponsorship.filter(|_| quote.intent.total_payment_max_amount().is_zero()).unzip();
         let tx = RelayTransaction::new(quote, authorization_list, eip712_digest)
+            .with_sponsorship_hold(sponsorship_hold)
             .with_quota_subject(quota_subject);
         self.inner.storage.add_bundle_tx(bundle_id, tx.id).await?;
 
@@ -1470,9 +1526,10 @@ impl Relay {
             let key_metadata =
                 metadata_entries(&request.capabilities.authorize_keys).map_err(RelayError::from)?;
 
-            let (asset_diffs, mut quotes) =
-                self.build_quotes(&request, &identity, nonce, delegation_status, user_id).await?;
-            quotes.key_metadata = key_metadata;
+            let (mut asset_diffs, mut quotes) = self
+                .build_quotes(&request, &identity, nonce, delegation_status, user_id, true)
+                .await?;
+            quotes.key_metadata = key_metadata.clone();
 
             // A zero payment with no fee payer means the policy sponsored these quotes. The
             // subject goes under the quote signature here, where the decision was made, so the
@@ -1488,6 +1545,38 @@ impl Relay {
                     )
                 })
                 .flatten();
+
+            // Only now is the cost known. A quote that does not fit is offered to the user to
+            // pay, the same as one the policy refused. One that can never be sent holds nothing.
+            if let Some(subject) = &quotes.quota_subject
+                && !quotes.quotes.iter().any(|q| q.has_deficits())
+                && !delegation_status.is_unknown()
+                && !self
+                    .inner
+                    .sponsorship
+                    .hold(
+                        quotes.digest(),
+                        subject,
+                        quotes
+                            .quotes
+                            .iter()
+                            .filter(|q| q.intent.total_payment_max_amount().is_zero())
+                            .map(|q| SponsoredCost {
+                                chain_id: q.chain_id,
+                                gas_limit: q.tx_gas,
+                                max_fee_per_gas: q.native_fee_estimate.max_fee_per_gas,
+                                expected: q.expected_cost,
+                            }),
+                        false,
+                        DateTime::<Utc>::from(quotes.ttl) + SPONSORSHIP_HOLD_MARGIN,
+                    )
+                    .await?
+            {
+                (asset_diffs, quotes) = self
+                    .build_quotes(&request, &identity, nonce, delegation_status, user_id, false)
+                    .await?;
+                quotes.key_metadata = key_metadata;
+            }
 
             // Compute EIP-712 digest for fee_payer quote if present
             let fee_payer_digest = quotes
@@ -1831,12 +1920,14 @@ impl Relay {
         nonce: U256,
         delegation_status: &DelegationStatus,
         user_id: Option<&str>,
+        sponsorable: bool,
     ) -> RpcResult<(AssetDiffResponse, Quotes)> {
         // Gas-sponsorship decision (Model A), evaluated once and applied to BOTH
         // the single-chain and multichain-funded paths below: when the policy
         // approves and the client supplied no fee_payer, the user's fee is zeroed
         // and the relay funder pays the on-chain gas.
-        let sponsored = request.capabilities.meta.fee_payer.is_none()
+        let sponsored = sponsorable
+            && request.capabilities.meta.fee_payer.is_none()
             && self
                 .inner
                 .sponsorship
@@ -2487,7 +2578,7 @@ impl Relay {
                 QuoteRole::User,
                 capabilities,
                 signature,
-                quotes.ty().quota_subject.clone(),
+                quotes.ty().quota_subject.clone().map(|subject| (subject, quotes.ty().digest())),
             )
             .await?;
 
@@ -2557,6 +2648,7 @@ impl Relay {
         // last quote is the output intent
         let dst_idx = quotes.ty().quotes.len() - 1;
         let quota_subject = quotes.ty().quota_subject.clone();
+        let quotes_digest = quotes.ty().digest();
 
         let root = intents.root()?;
         let has_many_user_quotes = quotes.ty().quotes.len() > 1;
@@ -2575,7 +2667,7 @@ impl Relay {
                 QuoteRole::User,
                 capabilities.clone(),
                 signature,
-                quota_subject.clone(),
+                quota_subject.clone().map(|subject| (subject, quotes_digest)),
             )
             .await
             .map(|tx| (idx, tx))
@@ -3965,11 +4057,41 @@ impl RelayApiServer for Relay {
             gas_limit,
         )
         .with_authorization_list(authorization_list)
-        .with_quota_subject(quota_subject)
+        .with_quota_subject(quota_subject.clone())
         .with_sponsored_for(eoa);
 
+        // Nothing is prepared ahead here, so the hold starts out sent.
+        let (tx, hold) = if let Some(subject) = &quota_subject {
+            let fees = provider.estimate_eip1559_fees().await.map_err(RelayError::from)?;
+            let digest = *tx.id;
+            // why: this lands now and is one transaction, so nothing stacks on its maximum.
+            let costs = [SponsoredCost {
+                chain_id,
+                gas_limit,
+                max_fee_per_gas: fees.max_fee_per_gas,
+                expected: U256::MAX,
+            }];
+            let until = Utc::now() + SENT_SPONSORSHIP_HOLD;
+            if !self.inner.sponsorship.hold(digest, subject, costs, true, until).await? {
+                return Err(RelayError::PreCallsNotSponsored { eoa, chain: chain_id }.into());
+            }
+            // why: the signer would otherwise pay any price, and past this one the hold is no
+            // longer the most it can cost.
+            (
+                tx.with_max_fee_per_gas(fees.max_fee_per_gas).with_sponsorship_hold(Some(digest)),
+                Some(digest),
+            )
+        } else {
+            (tx, None)
+        };
+
         let handle = chain.transactions().clone();
-        handle.send_transaction(tx.clone()).await.map_err(RelayError::from)?;
+        if let Err(err) = handle.send_transaction(tx.clone()).await {
+            if let Some(digest) = hold {
+                self.inner.storage.release_sponsorship(digest, chain_id).await?;
+            }
+            return Err(RelayError::from(err).into());
+        }
         let status = handle.wait_for_tx(tx.id).await.map_err(|_| {
             RelayError::InternalError(eyre::eyre!("failed to wait for transaction"))
         })?;

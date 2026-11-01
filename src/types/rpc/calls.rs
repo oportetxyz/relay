@@ -938,6 +938,7 @@ mod tests {
                     additional_authorization: None,
                     orchestrator: Address::ZERO,
                     fee_token_deficit: U256::ZERO,
+                    expected_cost: U256::ZERO,
                     asset_deficits: AssetDeficits(vec![AssetDeficit {
                         address: Some(Address::ZERO),
                         metadata: asset_metadata.clone(),

@@ -249,6 +249,52 @@ async fn refuses_to_land_when_not_sponsored() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A stored grant is sponsored without a quote, so nothing else holds its cost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_landing_is_held_like_a_quote() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let admin = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    let recovery = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    upgrade_account_eagerly(&env, &[admin.to_authorized()], &admin, AuthKind::Auth).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+
+    let policy = SponsorshipConfig {
+        sponsored_chains: [env.chain_id()].into(),
+        whitelisted_contracts: [env.eoa.address(), alloy::primitives::Address::ZERO]
+            .into_iter()
+            .collect(),
+        per_user_wei: U256::MAX,
+        circuit_breaker_wei: U256::MAX,
+        ..Default::default()
+    };
+    let base = env.config.clone();
+    let under = |sponsorship: SponsorshipConfig| {
+        let mut config = base.clone();
+        config.sponsorship = sponsorship;
+        config
+    };
+
+    let over_the_gas_cap = SponsorshipConfig { max_gas_per_tx: 21_000, ..policy.clone() };
+    env.restart_relay(under(over_the_gas_cap)).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+    assert!(execute(&env).await.is_err_and(|err| err.to_string().contains("not sponsor")));
+
+    let over_the_quota = SponsorshipConfig { per_user_wei: U256::ONE, ..policy.clone() };
+    env.restart_relay(under(over_the_quota)).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+    assert!(execute(&env).await.is_err_and(|err| err.to_string().contains("not sponsor")));
+
+    env.restart_relay(under(policy)).await?;
+    store_admin_grant(&env, &admin, &recovery).await?;
+    execute(&env).await?;
+    assert_recovery_key_on_chain(&env, &recovery, true).await;
+
+    let subject = env.eoa.address().to_string();
+    let held = env.relay_handle.storage.held_sponsorship_wei(&subject, env.chain_id());
+    assert_eq!(held.await?, U256::ZERO);
+    Ok(())
+}
+
 /// What the multichain nonce buys: one signature, stored on every chain, landed
 /// on every chain, with no per-chain ceremony.
 #[tokio::test(flavor = "multi_thread")]

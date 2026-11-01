@@ -21,7 +21,7 @@ use crate::{
     transactions::{PendingTransaction, PullGasState, RelayTransaction, TransactionStatus, TxId},
     types::{
         AssetDiffs, CreatableAccount, HistoricalPrice, HistoricalPriceKey, SignedCall,
-        SponsorshipUsage,
+        SponsorshipHold, SponsorshipUsage,
         rpc::{BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
@@ -465,6 +465,34 @@ impl StorageApi for RelayStorage {
 
     async fn record_sponsorship_usage(&self, usage: SponsorshipUsage) -> api::Result<()> {
         self.inner.record_sponsorship_usage(usage).await
+    }
+
+    async fn reserve_sponsorship(&self, holds: Vec<SponsorshipHold>) -> api::Result<bool> {
+        self.inner.reserve_sponsorship(holds).await
+    }
+
+    async fn claim_sponsorship(&self, digest: B256, until: DateTime<Utc>) -> api::Result<bool> {
+        self.inner.claim_sponsorship(digest, until).await
+    }
+
+    async fn unclaim_sponsorship(
+        &self,
+        digest: B256,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> api::Result<()> {
+        self.inner.unclaim_sponsorship(digest, until).await
+    }
+
+    async fn release_sponsorship(&self, digest: B256, chain_id: ChainId) -> api::Result<()> {
+        self.inner.release_sponsorship(digest, chain_id).await
+    }
+
+    async fn held_sponsorship_wei(
+        &self,
+        quota_subject: &str,
+        chain_id: ChainId,
+    ) -> api::Result<U256> {
+        self.inner.held_sponsorship_wei(quota_subject, chain_id).await
     }
 
     async fn sponsored_wei_in_window(

@@ -166,6 +166,9 @@ pub struct SignerInner {
     asset_info: AssetInfoServiceHandle,
 }
 
+/// How many times a receipt is read before the read counts as failed.
+const RECEIPT_READ_ATTEMPTS: u32 = 3;
+
 /// Waits between attempts to store a confirmed transaction, about 16s in total.
 const CONFIRMATION_RETRY_DELAYS: [Duration; 6] = [
     Duration::from_millis(250),
@@ -370,11 +373,17 @@ impl Signer {
     async fn on_failed_transaction(
         &self,
         tx: TxId,
+        sponsorship_hold: Option<B256>,
         err: impl TransactionFailureReason + 'static,
     ) -> Result<(), SignerError> {
         // Remove transaction from storage
         self.storage.remove_queued(tx).await?;
         self.storage.remove_pending_transaction(tx).await?;
+
+        // It never landed, so the relay paid nothing.
+        if let Some(digest) = sponsorship_hold {
+            self.storage.release_sponsorship(digest, self.chain_id).await?;
+        }
 
         // Update status
         self.update_tx_status(tx, TransactionStatus::failed(err)).await?;
@@ -592,11 +601,13 @@ impl Signer {
                 let new_tx = tx.tx.build(tx.nonce(), new_fees);
                 let replacement = self.sign_transaction(new_tx).await?;
                 self.storage.add_pending_envelope(tx.id(), &replacement).await?;
+                // why: before the send, whose response can be lost after the node took it. The
+                // landing check below only looks at what is listed here.
+                tx.sent.push(replacement.clone());
                 self.send_transaction(&replacement).await?;
                 self.metrics.replacements_sent.increment(1);
                 self.update_tx_status(tx.id(), TransactionStatus::Pending(*replacement.tx_hash()))
                     .await?;
-                tx.sent.push(replacement);
                 last_sent_at = Instant::now();
             } else {
                 trace!("was not able to wait for tx confirmation, attempting to resend");
@@ -634,8 +645,7 @@ impl Signer {
                 // After making sure that the nonce is occupied, check if it was occupied by one of
                 // the transactions sent before.
                 for sent in &tx.sent {
-                    if let Ok(Some(receipt)) =
-                        self.provider.get_transaction_receipt(*sent.tx_hash()).await
+                    if let Some(receipt) = self.receipt_with_retries(*sent.tx_hash()).await
                         && receipt.block_number.is_some()
                     {
                         self.on_confirmed_transaction(tx, receipt).await?;
@@ -645,11 +655,29 @@ impl Signer {
 
                 // None of the sent transactions confirmed, mark transaction as failed.
                 self.metrics.pending.decrement(1);
-                self.on_failed_transaction(tx.id(), err).await?;
+                // why: no hold back. It was broadcast, so it may have landed or still land, and
+                // a failed read looks the same as a miss. The hold lapses on its own.
+                self.on_failed_transaction(tx.id(), None, err).await?;
             }
         }
 
         Ok(())
+    }
+
+    /// Reads a receipt, retrying a failed read. `None` when the node has none or stays
+    /// unreachable.
+    async fn receipt_with_retries(&self, tx_hash: B256) -> Option<TransactionReceipt> {
+        for attempt in 1..=RECEIPT_READ_ATTEMPTS {
+            match self.provider.get_transaction_receipt(tx_hash).await {
+                Ok(receipt) => return receipt,
+                Err(err) if attempt < RECEIPT_READ_ATTEMPTS => {
+                    warn!(%err, %tx_hash, attempt, "failed to read a receipt, retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(err) => warn!(%err, %tx_hash, "failed to read a receipt, giving up"),
+            }
+        }
+        None
     }
 
     /// Broadcasts a given transaction and waits for it to be confirmed, notifying `status_tx` on
@@ -670,14 +698,14 @@ impl Signer {
         {
             Ok(fees) => fees,
             Err(err) => {
-                self.on_failed_transaction(tx.id, err).await?;
+                self.on_failed_transaction(tx.id, tx.sponsorship_hold, err).await?;
                 return Ok(());
             }
         };
 
         // Validate the transaction.
         if let Err(err) = self.validate_transaction(&mut tx, fees).await {
-            self.on_failed_transaction(tx.id, err).await?;
+            self.on_failed_transaction(tx.id, tx.sponsorship_hold, err).await?;
             return Ok(());
         }
 
@@ -685,6 +713,7 @@ impl Signer {
         let mut nonce = self.next_nonce().await;
 
         let tx_id = tx.id;
+        let sponsorship_hold = tx.sponsorship_hold;
 
         let try_send = async {
             let mut resynced = false;
@@ -732,7 +761,13 @@ impl Signer {
                     }
                     result => result?,
                 };
-                self.update_tx_status(tx_id, TransactionStatus::Pending(*signed.hash())).await?;
+                // why: the transaction is out. A status write must not turn it into a failure,
+                // that path treats it as never sent.
+                if let Err(err) =
+                    self.update_tx_status(tx_id, TransactionStatus::Pending(*signed.hash())).await
+                {
+                    warn!(%err, %tx_id, "failed to store the pending status of a sent transaction");
+                }
                 return Ok::<_, SignerError>((pending, receipt));
             }
         };
@@ -749,7 +784,7 @@ impl Signer {
             Err(err) => {
                 error!(%err, tx_id = %tx_id, signer = %self.address(), chain_id = %self.chain_id, "failed to send a transaction");
 
-                self.on_failed_transaction(tx_id, err).await?;
+                self.on_failed_transaction(tx_id, sponsorship_hold, err).await?;
 
                 // If no other transaction occupied the next nonce, we can just reset it.
                 {
@@ -940,7 +975,14 @@ impl Signer {
                 gas_price,
                 eth_spent: gas_used * gas_price,
             })
-            .await
+            .await?;
+
+        // why: after the booking, so the spend is never missing from both. Counting it twice
+        // until this runs only errs towards refusing.
+        match tx.sponsorship_hold {
+            Some(digest) => self.storage.release_sponsorship(digest, self.chain_id).await,
+            None => Ok(()),
+        }
     }
 
     /// Fetches receipt of a confirmed transaction and records metrics.

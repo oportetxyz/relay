@@ -381,6 +381,8 @@ impl TransactionService {
     /// Pushes a transaction to the queue.
     fn push_to_queue(&mut self, tx: RelayTransaction) {
         let tx_id = tx.id;
+        let sponsorship_hold = tx.sponsorship_hold;
+        let chain_id = tx.chain_id();
         if let Err(err) = self.queue.push_transaction(tx) {
             let status = TransactionStatus::failed(err);
 
@@ -390,6 +392,9 @@ impl TransactionService {
             let to_service = self.to_service.clone();
             self.tasks.spawn(async move {
                 storage.remove_queued(tx_id).await?;
+                if let Some(digest) = sponsorship_hold {
+                    storage.release_sponsorship(digest, chain_id).await?;
+                }
                 storage.write_transaction_status(tx_id, &status).await?;
                 let _ = to_service.send(SignerEvent::TransactionStatus(tx_id, status));
 
@@ -641,6 +646,7 @@ mod tests {
             intent: Intent::latest().with_eoa(sender).with_nonce(U256::random()),
             fee_token_deficit: Default::default(),
             asset_deficits: Default::default(),
+            expected_cost: U256::ZERO,
         };
         RelayTransaction::new(quote, vec![], B256::random())
     }

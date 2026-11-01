@@ -11,6 +11,8 @@ use alloy::{
     providers::{Provider, ext::AnvilApi},
     rpc::types::TransactionReceipt,
 };
+use chrono::{TimeDelta, Utc};
+use futures_util::future::join_all;
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use relay::{
@@ -19,16 +21,16 @@ use relay::{
     signers::Eip712PayLoadSigner,
     storage::StorageApi,
     types::{
-        Call, KeyType, KeyWith712Signer,
+        Call, IERC20, KeyType, KeyWith712Signer,
         OrchestratorContract::IntentExecuted,
-        QuotaKey, SponsorshipConfig, SponsorshipUsage,
+        QuotaKey, SponsorshipConfig, SponsorshipHold, SponsorshipQuotaParameters, SponsorshipUsage,
         rpc::{
             BundleId, Meta, PrepareCallsCapabilities, PrepareCallsParameters, PrepareCallsResponse,
         },
     },
 };
 use sqlx::{PgPool, raw_sql};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// `PUSH1 0 PUSH1 0 REVERT`
 pub(super) const REVERTS: Bytes = bytes!("60006000fd");
@@ -133,6 +135,16 @@ async fn prepare_through(
     env: &Environment,
     key: &KeyWith712Signer,
 ) -> eyre::Result<PrepareCallsResponse> {
+    prepare_with_nonce(client, env, key, None).await
+}
+
+/// Prepares the test account's intent at `nonce`.
+async fn prepare_with_nonce(
+    client: &HttpClient,
+    env: &Environment,
+    key: &KeyWith712Signer,
+    nonce: Option<U256>,
+) -> eyre::Result<PrepareCallsResponse> {
     Ok(client
         .prepare_calls(PrepareCallsParameters {
             from: Some(env.eoa.address()),
@@ -140,7 +152,7 @@ async fn prepare_through(
             chain_id: env.chain_id(),
             key: Some(key.to_call_key()),
             capabilities: PrepareCallsCapabilities {
-                meta: Meta { fee_payer: None, fee_token: Some(env.fee_token), nonce: None },
+                meta: Meta { fee_payer: None, fee_token: Some(env.fee_token), nonce },
                 ..Default::default()
             },
             ..Default::default()
@@ -152,6 +164,12 @@ async fn prepare_through(
 fn charged(response: &PrepareCallsResponse) -> U256 {
     let quotes = response.context.quote().expect("a quote").ty();
     quotes.quotes.first().expect("one quote").intent.total_payment_max_amount()
+}
+
+/// The most the quote can cost the relay.
+fn max_cost(response: &PrepareCallsResponse) -> U256 {
+    let quote = response.context.quote().expect("a quote").ty().quotes.first().expect("one quote");
+    U256::from(quote.tx_gas) * U256::from(quote.native_fee_estimate.max_fee_per_gas)
 }
 
 /// Sends an intent, makes `outcome` true on chain, and returns what the relay paid.
@@ -242,22 +260,27 @@ async fn does_not_book_a_paying_intent_that_fails() -> eyre::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_spend_counts_against_the_quota() -> eyre::Result<()> {
     let mut env = Environment::setup().await?;
-    let sponsorship = SponsorshipConfig {
-        sponsored_chains: [env.chain_id()].into(),
-        whitelisted_contracts: std::iter::once(env.erc20).collect(),
-        per_user_wei: U256::from(1),
-        circuit_breaker_wei: U256::MAX,
-        window_hours: 24,
-        ..Default::default()
-    };
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
     let key = account(&mut env, sponsorship).await?;
-    let erc20_code = env.provider().get_code_at(env.erc20).await?;
 
-    assert!(charged(&prepare(&env, &key).await?).is_zero());
-    land(&env, &key, Outcome::CallReverts).await?;
+    let spent = land(&env, &key, Outcome::CallReverts).await?;
+    assert!(!spent.is_zero());
 
-    env.provider().anvil_set_code(env.erc20, erc20_code).await?;
-    assert!(!charged(&prepare(&env, &key).await?).is_zero());
+    let hold = |quota_cap| SponsorshipHold {
+        digest: B256::random(),
+        chain_id: env.chain_id(),
+        quota_subject: env.eoa.address().to_string(),
+        amount: U256::from(10),
+        max_amount: U256::from(10),
+        expires_at: Utc::now() + TimeDelta::minutes(1),
+        claimed: false,
+        quota_cap,
+        breaker_cap: U256::MAX,
+        window_hours: 24,
+    };
+    let storage = &env.relay_handle.storage;
+    assert!(!storage.reserve_sponsorship(vec![hold(spent + U256::from(9))]).await?);
+    assert!(storage.reserve_sponsorship(vec![hold(spent + U256::from(10))]).await?);
 
     Ok(())
 }
@@ -463,4 +486,497 @@ async fn books_the_subject_bound_at_prepare() -> eyre::Result<()> {
 
     assert_eq!(booked_for(&env, SUBJECT).await?, before + spent);
     assert_booked(&env, U256::ZERO).await
+}
+
+/// What one quote holds against the quota, and the most it can cost.
+#[derive(Clone, Copy)]
+struct Costs {
+    expected: U256,
+    maximum: U256,
+}
+
+/// Prepares `count` quotes before any is sent, sends them all, and returns how many the relay
+/// sponsored. `limits` receives what one quote costs and returns the policy to run under.
+async fn sponsor_inside_one_ttl(
+    env: &mut Environment,
+    count: u64,
+    limits: impl FnOnce(Costs) -> SponsorshipConfig,
+) -> eyre::Result<usize> {
+    let unlimited = limited(env, U256::MAX, U256::MAX);
+    let key = account(env, unlimited).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+    let probe = prepare(env, &key).await?;
+    let costs = Costs { expected: held(env).await?, maximum: max_cost(&probe) };
+    let digest = probe.context.quote().expect("a quote").ty().digest();
+    env.relay_handle.storage.release_sponsorship(digest, env.chain_id()).await?;
+    let mut config = env.config.clone();
+    config.sponsorship = limits(costs);
+    env.restart_relay(config).await?;
+
+    let mut prepared = Vec::new();
+    for sequence in 1..=count {
+        let nonce = Some(U256::from(sequence) << 64);
+        prepared.push(prepare_with_nonce(&env.relay_endpoint, env, &key, nonce).await?);
+    }
+    let sponsored = prepared.iter().filter(|response| charged(response).is_zero()).count();
+
+    for response in prepared {
+        let signature = key.sign_payload_hash(response.digest).await?;
+        let bundle_id = send_prepared_calls(env, &key, signature, response.context).await?;
+        await_calls_status(env, bundle_id).await?;
+    }
+    Ok(sponsored)
+}
+
+/// A policy on the test chain with the two limits it is given.
+fn limited(env: &Environment, per_user_wei: U256, circuit_breaker_wei: U256) -> SponsorshipConfig {
+    SponsorshipConfig {
+        sponsored_chains: [env.chain_id()].into(),
+        whitelisted_contracts: std::iter::once(env.erc20).collect(),
+        per_user_wei,
+        circuit_breaker_wei,
+        window_hours: 24,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quotes_prepared_inside_one_ttl_stop_at_the_quota() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let chain = env.chain_id();
+    let erc20 = env.erc20;
+    let sponsored = sponsor_inside_one_ttl(&mut env, 5, |cost| SponsorshipConfig {
+        sponsored_chains: [chain].into(),
+        whitelisted_contracts: std::iter::once(erc20).collect(),
+        per_user_wei: cost.expected * U256::from(5) / U256::from(2),
+        circuit_breaker_wei: U256::MAX,
+        window_hours: 24,
+        ..Default::default()
+    })
+    .await?;
+
+    assert_eq!(sponsored, 2);
+    Ok(())
+}
+
+// The reason a hold is not the maximum: a quota one maximum wide still takes several quotes,
+// as when a user abandons a prompt and tries again.
+#[tokio::test(flavor = "multi_thread")]
+async fn quotes_inside_one_ttl_fit_a_quota_narrower_than_their_maximum() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let chain = env.chain_id();
+    let erc20 = env.erc20;
+    let mut seen = None;
+    let sponsored = sponsor_inside_one_ttl(&mut env, 2, |cost| {
+        seen = Some(cost);
+        SponsorshipConfig {
+            sponsored_chains: [chain].into(),
+            whitelisted_contracts: std::iter::once(erc20).collect(),
+            per_user_wei: cost.expected * U256::from(2),
+            circuit_breaker_wei: U256::MAX,
+            window_hours: 24,
+            ..Default::default()
+        }
+    })
+    .await?;
+
+    let cost = seen.expect("the limits were read");
+    assert!(cost.expected * U256::from(2) < cost.maximum);
+    assert_eq!(sponsored, 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quotes_prepared_inside_one_ttl_stop_at_the_breaker() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let chain = env.chain_id();
+    let erc20 = env.erc20;
+    let sponsored = sponsor_inside_one_ttl(&mut env, 5, |cost| SponsorshipConfig {
+        sponsored_chains: [chain].into(),
+        whitelisted_contracts: std::iter::once(erc20).collect(),
+        per_user_wei: U256::MAX,
+        circuit_breaker_wei: cost.maximum * U256::from(5) / U256::from(2),
+        window_hours: 24,
+        ..Default::default()
+    })
+    .await?;
+
+    assert_eq!(sponsored, 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sponsored_quote_is_sent_once() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let response = prepare(&env, &key).await?;
+    let signature = key.sign_payload_hash(response.digest).await?;
+    env.disable_mining().await;
+
+    let storage = &env.relay_handle.storage;
+    let first =
+        send_prepared_calls(&env, &key, signature.clone(), response.context.clone()).await?;
+    assert_eq!(storage.get_bundle_transactions(first).await?.len(), 1);
+
+    // The answer got lost, so the transport sends it again: same bundle, nothing new sent.
+    let again = send_prepared_calls(&env, &key, signature.clone(), response.context.clone());
+    assert_eq!(again.await?, first);
+    assert_eq!(storage.get_bundle_transactions(first).await?.len(), 1);
+    env.enable_mining().await;
+    await_calls_status(&env, first).await?;
+    assert_eq!(held(&env).await?, U256::ZERO);
+
+    // Still true once it landed and its hold is gone.
+    assert_eq!(send_prepared_calls(&env, &key, signature, response.context).await?, first);
+    assert_eq!(storage.get_bundle_transactions(first).await?.len(), 1);
+    Ok(())
+}
+
+// A resend is answered only when something went out. With no hold left to claim and no bundle
+// to point at, a sponsored quote stays refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_with_no_hold_and_no_bundle_is_refused() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let response = prepare(&env, &key).await?;
+    let digest = response.context.quote().expect("a quote").ty().digest();
+    env.relay_handle.storage.release_sponsorship(digest, env.chain_id()).await?;
+
+    let signature = key.sign_payload_hash(response.digest).await?;
+    assert!(send_prepared_calls(&env, &key, signature, response.context).await.is_err());
+    Ok(())
+}
+
+// A user who confirms in the last moments of the TTL gets their send, like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_sent_at_the_end_of_its_ttl_lands() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    env.config = env.config.clone().with_quote_ttl(Duration::from_secs(3));
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let response = prepare(&env, &key).await?;
+    assert!(charged(&response).is_zero());
+    let ttl = response.context.quote().expect("a quote").ty().ttl;
+    let left = ttl.duration_since(SystemTime::now())?;
+    tokio::time::sleep(left - Duration::from_millis(150)).await;
+
+    let signature = key.sign_payload_hash(response.digest).await?;
+    let bundle = send_prepared_calls(&env, &key, signature, response.context).await?;
+    await_calls_status(&env, bundle).await?;
+    Ok(())
+}
+
+// A send past the quote check has already been let through, so its hold has to be there
+// however late it was and whatever the clock of the database says.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hold_outlives_its_quote() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    env.config = env.config.clone().with_quote_ttl(Duration::from_secs(1));
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let response = prepare(&env, &key).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let digest = response.context.quote().expect("a quote").ty().digest();
+    let until = Utc::now() + TimeDelta::minutes(1);
+    assert!(env.relay_handle.storage.claim_sponsorship(digest, until).await?);
+    Ok(())
+}
+
+// What a transport retry does after a send that failed: the same signed quote goes again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_that_failed_can_go_again() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let response = prepare(&env, &key).await?;
+    let signature = key.sign_payload_hash(response.digest).await?;
+
+    // An account that lost its delegation is refused after the claim, before anything is sent.
+    let eoa = env.eoa.address();
+    let code = env.provider().get_code_at(eoa).await?;
+    env.provider().anvil_set_code(eoa, Bytes::new()).await?;
+    let refused =
+        send_prepared_calls(&env, &key, signature.clone(), response.context.clone()).await;
+    assert!(refused.is_err());
+    assert!(!held(&env).await?.is_zero());
+    env.provider().anvil_set_code(eoa, code).await?;
+
+    let bundle = send_prepared_calls(&env, &key, signature, response.context).await?;
+    await_calls_status(&env, bundle).await?;
+    Ok(())
+}
+
+/// The live holds of the test account.
+async fn held(env: &Environment) -> eyre::Result<U256> {
+    let subject = env.eoa.address().to_string();
+    Ok(env.relay_handle.storage.held_sponsorship_wei(&subject, env.chain_id()).await?)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hold_is_replaced_by_the_real_spend_at_landing() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let response = prepare(&env, &key).await?;
+    assert!(charged(&response).is_zero());
+    let expected = held(&env).await?;
+    assert!(!expected.is_zero() && expected < max_cost(&response));
+
+    let spent = land_prepared(&env, &key, response, Outcome::Succeeds).await?;
+    assert_eq!(held(&env).await?, U256::ZERO);
+    assert!(spent <= expected, "landed at {spent}, expected at most {expected}");
+    println!("sponsored cost: spent {spent}, expected {expected}");
+    assert_booked(&env, spent).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_that_never_lands_gives_its_hold_back() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    // Accepted at send, and dropped by the signer's validation.
+    let response = prepare(&env, &key).await?;
+    let stranger = KeyWith712Signer::random_admin(KeyType::Secp256k1)?.unwrap();
+    let signature = stranger.sign_payload_hash(response.digest).await?;
+    let bundle_id = send_prepared_calls(&env, &stranger, signature, response.context).await?;
+    let _ = await_calls_status(&env, bundle_id).await;
+
+    assert_eq!(held(&env).await?, U256::ZERO);
+    assert_booked(&env, U256::ZERO).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsent_quote_gives_its_hold_back_when_it_expires() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    env.config = env.config.clone().with_quote_ttl(Duration::from_secs(2));
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    prepare(&env, &key).await?;
+    let cost = held(&env).await?;
+    assert!(!cost.is_zero());
+
+    // Past the quote's two seconds and the margin the hold keeps after it.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(held(&env).await?, U256::ZERO);
+
+    let mut config = env.config.clone();
+    config.sponsorship = limited(&env, cost * U256::from(2), U256::MAX);
+    env.restart_relay(config).await?;
+    assert!(charged(&prepare(&env, &key).await?).is_zero());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_over_the_gas_cap_is_not_sponsored() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship =
+        SponsorshipConfig { max_gas_per_tx: 21_000, ..limited(&env, U256::MAX, U256::MAX) };
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    assert!(!charged(&prepare(&env, &key).await?).is_zero());
+    assert_eq!(held(&env).await?, U256::ZERO);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_holds_cannot_share_the_same_room() -> eyre::Result<()> {
+    let env = Environment::setup().await?;
+    let storage = &env.relay_handle.storage;
+    let hold = |quota_cap, breaker_cap| SponsorshipHold {
+        digest: B256::random(),
+        chain_id: env.chain_id(),
+        quota_subject: format!("subject-{}", B256::random()),
+        amount: U256::from(10),
+        max_amount: U256::from(10),
+        expires_at: Utc::now() + TimeDelta::minutes(1),
+        claimed: false,
+        quota_cap,
+        breaker_cap,
+        window_hours: 24,
+    };
+
+    let one_subject = hold(U256::from(50), U256::MAX);
+    let accepted = join_all((0..20).map(|_| {
+        storage.reserve_sponsorship(vec![SponsorshipHold {
+            digest: B256::random(),
+            ..one_subject.clone()
+        }])
+    }))
+    .await;
+    let accepted = accepted.into_iter().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(accepted.iter().filter(|fits| **fits).count(), 5);
+
+    let accepted = join_all(
+        (0..20).map(|_| storage.reserve_sponsorship(vec![hold(U256::MAX, U256::from(150))])),
+    )
+    .await;
+    let accepted = accepted.into_iter().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(accepted.iter().filter(|fits| **fits).count(), 10);
+    Ok(())
+}
+
+// A hold that counts little against the quota still takes its whole maximum from the breaker,
+// so holds accepted together cannot land past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_breaker_counts_the_most_a_hold_can_cost() -> eyre::Result<()> {
+    let env = Environment::setup().await?;
+    let storage = &env.relay_handle.storage;
+    let subject = format!("subject-{}", B256::random());
+    let hold = |quota_cap, breaker_cap| {
+        vec![SponsorshipHold {
+            digest: B256::random(),
+            chain_id: env.chain_id(),
+            quota_subject: subject.clone(),
+            amount: U256::from(1),
+            max_amount: U256::from(100),
+            expires_at: Utc::now() + TimeDelta::minutes(1),
+            claimed: false,
+            quota_cap,
+            breaker_cap,
+            window_hours: 24,
+        }]
+    };
+
+    assert!(storage.reserve_sponsorship(hold(U256::from(3), U256::from(250))).await?);
+    assert!(storage.reserve_sponsorship(hold(U256::from(3), U256::from(250))).await?);
+    assert!(!storage.reserve_sponsorship(hold(U256::from(3), U256::from(250))).await?);
+
+    assert!(storage.reserve_sponsorship(hold(U256::from(3), U256::MAX)).await?);
+    assert!(!storage.reserve_sponsorship(hold(U256::from(3), U256::MAX)).await?);
+
+    // One that does not fit takes the ones before it down with it.
+    let room = storage.held_sponsorship_wei(&subject, env.chain_id()).await?;
+    let both = [hold(U256::from(100), U256::MAX), hold(U256::from(3), U256::MAX)].concat();
+    assert!(!storage.reserve_sponsorship(both).await?);
+    assert_eq!(storage.held_sponsorship_wei(&subject, env.chain_id()).await?, room);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_the_account_cannot_fund_holds_nothing() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    let key = account(&mut env, sponsorship).await?;
+
+    let balance = IERC20::IERC20Instance::new(env.erc20, env.provider())
+        .balanceOf(env.eoa.address())
+        .call()
+        .await?;
+    let response = env
+        .relay_endpoint
+        .prepare_calls(PrepareCallsParameters {
+            from: Some(env.eoa.address()),
+            calls: vec![Call::transfer(env.erc20, Address::random(), balance + U256::from(1))],
+            chain_id: env.chain_id(),
+            capabilities: PrepareCallsCapabilities {
+                meta: Meta { fee_payer: None, fee_token: Some(env.fee_token), nonce: None },
+                authorize_keys: vec![],
+                revoke_keys: vec![],
+                pre_calls: vec![],
+                pre_call: false,
+                required_funds: vec![],
+            },
+            state_overrides: Default::default(),
+            balance_overrides: Default::default(),
+            key: Some(key.to_call_key()),
+        })
+        .await?;
+
+    assert!(response.context.quote().expect("a quote").ty().quotes[0].has_deficits());
+    assert_eq!(held(&env).await?, U256::ZERO);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_for_an_unknown_account_holds_nothing() -> eyre::Result<()> {
+    let mut env = Environment::setup().await?;
+    let sponsorship = limited(&env, U256::MAX, U256::MAX);
+    account(&mut env, sponsorship).await?;
+
+    let eoa = Address::random();
+    mint_erc20s(&[env.erc20, env.fee_token], &[eoa], env.provider()).await?;
+    let response = env
+        .relay_endpoint
+        .prepare_calls(PrepareCallsParameters {
+            from: Some(eoa),
+            calls: vec![Call::transfer(env.erc20, Address::random(), U256::from(1))],
+            chain_id: env.chain_id(),
+            capabilities: PrepareCallsCapabilities {
+                meta: Meta { fee_payer: None, fee_token: Some(env.fee_token), nonce: None },
+                authorize_keys: vec![],
+                revoke_keys: vec![],
+                pre_calls: vec![],
+                pre_call: false,
+                required_funds: vec![],
+            },
+            state_overrides: Default::default(),
+            balance_overrides: Default::default(),
+            key: None,
+        })
+        .await?;
+
+    // why: funded, so the only thing keeping this quote from holding is the unknown account.
+    assert!(!response.context.quote().expect("a quote").ty().quotes[0].has_deficits());
+    let holds =
+        env.relay_handle.storage.held_sponsorship_wei(&eoa.to_string(), env.chain_id()).await?;
+    assert_eq!(holds, U256::ZERO);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reported_quota_leaves_out_what_is_held() -> eyre::Result<()> {
+    const DEV_KEY: &str = "e2e-dev-key";
+
+    let mut env = Environment::setup().await?;
+    let cap = U256::from(u128::MAX);
+    let sponsorship = SponsorshipConfig {
+        quota_overrides: [("dev-local".to_string(), u128::MAX)].into(),
+        ..limited(&env, cap, U256::MAX)
+    };
+    env.config.auth = Some(AuthConfig {
+        jwks_url: "http://127.0.0.1:1/jwks".to_string(),
+        dev_api_key: Some(DEV_KEY.to_string()),
+        dev_subject: None,
+    });
+    let key = account(&mut env, sponsorship).await?;
+    mint_erc20s(&[env.erc20], &[env.eoa.address()], env.provider()).await?;
+
+    let response = prepare(&env, &key).await?;
+    let with_token = HttpClientBuilder::default()
+        .set_headers(HeaderMap::from_iter([(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {DEV_KEY}"))?,
+        )]))
+        .build(env.relay_handle.http_url())?;
+    let quota = with_token
+        .sponsorship_quota(SponsorshipQuotaParameters {
+            chain_id: env.chain_id(),
+            account: Some(env.eoa.address()),
+        })
+        .await?;
+
+    let held = held(&env).await?;
+    assert!(!held.is_zero() && held < max_cost(&response));
+    assert_eq!(quota.remaining_wei, cap - held);
+    Ok(())
 }

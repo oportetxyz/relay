@@ -7,15 +7,16 @@
 
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, ChainId, FixedBytes, U256};
+use alloy::primitives::{Address, B256, ChainId, FixedBytes, U256};
+use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
 use crate::{
     error::StorageError,
     storage::{RelayStorage, StorageApi},
     types::{
-        Call, ChainSponsorshipConfig, QuotaKey, QuotaSubject, SponsorshipBreakerStatus,
-        SponsorshipConfig, SponsorshipQuotaResponse,
+        Call, ChainSponsorshipConfig, QuotaKey, QuotaSubject, SponsoredCost,
+        SponsorshipBreakerStatus, SponsorshipConfig, SponsorshipHold, SponsorshipQuotaResponse,
     },
 };
 
@@ -155,6 +156,51 @@ impl SponsorshipEvaluator {
         Ok(true)
     }
 
+    /// Holds each sponsored transaction against the limits of its chain, until it settles at
+    /// landing or `expires_at` passes: its expected cost against the quota, and the most it
+    /// can cost against the breaker. All or nothing: false means at least one is too big or
+    /// does not fit, and nothing was held.
+    ///
+    /// A `sponsor_all` chain has no limits to hold against, so it only records the hold.
+    pub async fn hold(
+        &self,
+        digest: B256,
+        subject: &QuotaSubject,
+        costs: impl IntoIterator<Item = SponsoredCost>,
+        claimed: bool,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let mut holds = Vec::new();
+        for cost in costs {
+            let chain_id = cost.chain_id;
+            let cfg = self.config_for(chain_id);
+            if !cfg.sponsor_all && cost.gas_limit > cfg.max_gas_per_tx {
+                let gas = cost.gas_limit;
+                warn!(chain_id, gas, "sponsorship denied: over the gas cap per transaction");
+                return Ok(false);
+            }
+            let (quota_cap, breaker_cap) = if cfg.sponsor_all {
+                (U256::MAX, U256::MAX)
+            } else {
+                let cap = cfg.quota_overrides.get(subject.as_str()).copied().map(U256::from);
+                (cap.unwrap_or(cfg.per_user_wei), cfg.circuit_breaker_wei)
+            };
+            holds.push(SponsorshipHold {
+                digest,
+                chain_id,
+                quota_subject: subject.as_str().to_owned(),
+                amount: cost.expected.min(cost.maximum()),
+                max_amount: cost.maximum(),
+                expires_at,
+                claimed,
+                quota_cap,
+                breaker_cap,
+                window_hours: cfg.window_hours,
+            });
+        }
+        self.storage.reserve_sponsorship(holds).await
+    }
+
     /// What `wallet_sponsorshipQuota` reports: the same cap, window and ledger
     /// reads `is_sponsored` decides on, so the number a user sees is the number
     /// the relay enforces. `None` when no subject can be resolved (address
@@ -176,6 +222,7 @@ impl SponsorshipEvaluator {
             cfg.quota_overrides.get(&subject).copied().map(U256::from).unwrap_or(cfg.per_user_wei);
         let spent =
             self.storage.sponsored_wei_in_window(&subject, chain_id, cfg.window_hours).await?;
+        let held = self.storage.held_sponsorship_wei(&subject, chain_id).await?;
         let global =
             self.storage.global_sponsored_wei_in_window(chain_id, cfg.window_hours).await?;
         let resets_at = self
@@ -192,7 +239,7 @@ impl SponsorshipEvaluator {
             window_hours: cfg.window_hours,
             cap_wei: cap,
             spent_wei: spent,
-            remaining_wei: cap.saturating_sub(spent),
+            remaining_wei: cap.saturating_sub(spent).saturating_sub(held),
             resets_at,
             breaker: SponsorshipBreakerStatus {
                 cap_wei: cfg.circuit_breaker_wei,
@@ -240,6 +287,37 @@ mod tests {
         let storage = RelayStorage::in_memory();
         let eval = SponsorshipEvaluator::new(cfg, HashMap::default(), storage.clone());
         (eval, storage)
+    }
+
+    use crate::types::expected_sponsored_cost;
+
+    fn cost(expected: u64) -> SponsoredCost {
+        SponsoredCost {
+            chain_id: CHAIN,
+            gas_limit: 1_000,
+            max_fee_per_gas: 10,
+            expected: U256::from(expected),
+        }
+    }
+
+    // The quota counts what a transaction should cost and the breaker the most it can, and
+    // an expected cost above the maximum counts as the maximum.
+    #[tokio::test]
+    async fn a_hold_counts_the_expected_cost_up_to_the_maximum() {
+        let (eval, storage) = evaluator(user_mode_cfg());
+        let subject = QuotaSubject::new(DEV_SUB.to_string());
+        let until = Utc::now() + chrono::TimeDelta::minutes(1);
+
+        assert!(eval.hold(B256::random(), &subject, [cost(300)], false, until).await.unwrap());
+        assert_eq!(storage.held_sponsorship_wei(DEV_SUB, CHAIN).await.unwrap(), U256::from(300));
+
+        assert!(eval.hold(B256::random(), &subject, [cost(50_000)], false, until).await.unwrap());
+        assert_eq!(storage.held_sponsorship_wei(DEV_SUB, CHAIN).await.unwrap(), U256::from(10_300));
+    }
+
+    #[test]
+    fn an_expected_cost_carries_a_quarter_on_top() {
+        assert_eq!(expected_sponsored_cost(1_000, 8), U256::from(10_000));
     }
 
     fn call_to(to: Address) -> Call {

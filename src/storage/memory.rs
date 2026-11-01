@@ -18,7 +18,7 @@ use crate::{
     },
     types::{
         AssetDiffs, CreatableAccount, HistoricalPrice, HistoricalPriceKey, SignedCall,
-        SponsorshipUsage,
+        SponsorshipHold, SponsorshipUsage,
         rpc::{BundleId, KeyMetadata, KeyMetadataEntry},
     },
 };
@@ -121,6 +121,7 @@ pub struct InMemoryStorage {
     asset_diffs: DashMap<TxId, AssetDiffs>,
     historical_usd_prices: DashMap<HistoricalPriceKey, f64>,
     sponsorship_usage: RwLock<Vec<InMemSponsorshipUsage>>,
+    sponsorship_holds: RwLock<Vec<SponsorshipHold>>,
 }
 
 impl InMemoryStorage {
@@ -986,6 +987,98 @@ impl StorageApi for InMemoryStorage {
             at: Utc::now().timestamp(),
         });
         Ok(())
+    }
+
+    async fn reserve_sponsorship(&self, holds: Vec<SponsorshipHold>) -> Result<bool> {
+        // why: the write lock is held from the check to the insert, like the chain lock in
+        // Postgres, so two callers cannot both fit in the same room.
+        let mut stored = self.sponsorship_holds.write().await;
+        let now = Utc::now();
+        stored.retain(|hold| hold.expires_at > now);
+        let ledger = self.sponsorship_usage.read().await;
+
+        let mut accepted: Vec<&SponsorshipHold> = Vec::new();
+        for hold in &holds {
+            let cutoff = now.timestamp() - (hold.window_hours as i64) * 3600;
+            let on_chain =
+                || ledger.iter().filter(|e| e.chain_id == hold.chain_id && e.at >= cutoff);
+            let live = || {
+                stored
+                    .iter()
+                    .chain(accepted.iter().copied())
+                    .filter(|h| h.chain_id == hold.chain_id)
+            };
+            let chain_total = on_chain()
+                .map(|e| e.eth_spent)
+                .chain(live().map(|h| h.max_amount))
+                .fold(U256::ZERO, U256::saturating_add);
+            let subject_total = on_chain()
+                .filter(|e| e.quota_subject == hold.quota_subject)
+                .map(|e| e.eth_spent)
+                .chain(live().filter(|h| h.quota_subject == hold.quota_subject).map(|h| h.amount))
+                .fold(U256::ZERO, U256::saturating_add);
+
+            if subject_total.saturating_add(hold.amount) > hold.quota_cap
+                || chain_total.saturating_add(hold.max_amount) > hold.breaker_cap
+            {
+                return Ok(false);
+            }
+            accepted.push(hold);
+        }
+        drop(ledger);
+
+        for hold in holds {
+            if !stored.iter().any(|h| h.digest == hold.digest && h.chain_id == hold.chain_id) {
+                stored.push(hold);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn claim_sponsorship(&self, digest: B256, until: DateTime<Utc>) -> Result<bool> {
+        let now = Utc::now();
+        let mut claimed = false;
+        for hold in self.sponsorship_holds.write().await.iter_mut() {
+            if hold.digest == digest && !hold.claimed && hold.expires_at > now {
+                hold.claimed = true;
+                hold.expires_at = until;
+                claimed = true;
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn unclaim_sponsorship(&self, digest: B256, until: DateTime<Utc>) -> Result<()> {
+        for hold in self.sponsorship_holds.write().await.iter_mut() {
+            if hold.digest == digest {
+                hold.claimed = false;
+                hold.expires_at = until;
+            }
+        }
+        Ok(())
+    }
+
+    async fn release_sponsorship(&self, digest: B256, chain_id: ChainId) -> Result<()> {
+        self.sponsorship_holds
+            .write()
+            .await
+            .retain(|hold| hold.digest != digest || hold.chain_id != chain_id);
+        Ok(())
+    }
+
+    async fn held_sponsorship_wei(&self, quota_subject: &str, chain_id: ChainId) -> Result<U256> {
+        let now = Utc::now();
+        Ok(self
+            .sponsorship_holds
+            .read()
+            .await
+            .iter()
+            .filter(|hold| {
+                hold.quota_subject == quota_subject
+                    && hold.chain_id == chain_id
+                    && hold.expires_at > now
+            })
+            .fold(U256::ZERO, |total, hold| total.saturating_add(hold.amount)))
     }
 
     async fn sponsored_wei_in_window(
