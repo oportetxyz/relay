@@ -134,11 +134,16 @@ pub struct ChainSponsorshipConfig {
     /// Override for [`SponsorshipConfig::max_gas_per_tx`].
     #[serde(default)]
     pub max_gas_per_tx: Option<u64>,
+    /// Merged over [`SponsorshipConfig::quota_overrides`], entry by entry: a cap is
+    /// in the chain's own native unit, so one number cannot fit every chain.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub quota_overrides: HashMap<String, u128>,
 }
 
 impl SponsorshipConfig {
     /// Resolve the effective policy for a chain: per-chain fields override the
-    /// base; unset fields fall back to the base.
+    /// base; unset fields fall back to the base. `quota_overrides` merges instead,
+    /// so a subject the chain does not name keeps its global cap.
     pub fn resolve(
         &self,
         chain_id: ChainId,
@@ -147,6 +152,9 @@ impl SponsorshipConfig {
         let Some(o) = overrides.get(&chain_id) else {
             return self.clone();
         };
+
+        let mut quota_overrides = self.quota_overrides.clone();
+        quota_overrides.extend(o.quota_overrides.iter().map(|(k, v)| (k.clone(), *v)));
 
         SponsorshipConfig {
             sponsor_all: o.sponsor_all.unwrap_or(self.sponsor_all),
@@ -167,8 +175,7 @@ impl SponsorshipConfig {
             verified_skips_target_guard: o
                 .verified_skips_target_guard
                 .unwrap_or(self.verified_skips_target_guard),
-            // Per-subject overrides are relay-global, not per-chain overridable.
-            quota_overrides: self.quota_overrides.clone(),
+            quota_overrides,
             max_gas_per_tx: o.max_gas_per_tx.unwrap_or(self.max_gas_per_tx),
         }
     }
