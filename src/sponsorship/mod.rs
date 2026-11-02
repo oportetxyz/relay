@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use alloy::primitives::{Address, B256, ChainId, FixedBytes, U256};
 use chrono::{DateTime, Utc};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     error::StorageError,
@@ -149,7 +149,11 @@ impl SponsorshipEvaluator {
         let spent =
             self.storage.sponsored_wei_in_window(&subject, chain_id, cfg.window_hours).await?;
         if spent >= cap {
-            debug!(%eoa, chain_id, "sponsorship denied: per-user quota exhausted");
+            // A user's subject is their account id and stays out of logs. A subject the
+            // config names, such as the dev hatch, is a label.
+            let subject =
+                if cfg.quota_overrides.contains_key(&subject) { subject.as_str() } else { "user" };
+            warn!(%eoa, chain_id, subject, %cap, %spent, "sponsorship denied: per-user quota exhausted");
             return Ok(false);
         }
 
@@ -267,6 +271,36 @@ mod tests {
     const OFF_TARGET: Address = address!("00000000000000000000000000000000000000bb");
     const EOA: Address = address!("00000000000000000000000000000000000000c0");
     const DEV_SUB: &str = "dev-local";
+    const OTHER_CHAIN: ChainId = 8453; // Has a chain block, with no quota overrides.
+    const UNLISTED_CHAIN: ChainId = 137; // Has no chain block at all.
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn take(&self) -> String {
+            String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// A policy that gates by verified user id, sponsors only `CHAIN`, and only
     /// permits calls to `TARGET`. 0.01 ETH per-user / 1 ETH global, 24h window.
@@ -495,6 +529,104 @@ mod tests {
         // because it uses the 0.01 ETH global cap (no override).
         seed(&storage, "normal-user", CHAIN, U256::from(1_000_000_000_000_000u128)).await;
         assert!(eval.is_sponsored(EOA, Some("normal-user"), &calls, CHAIN).await.unwrap());
+    }
+
+    // Caps are in each chain's native unit, so a chain can raise one subject's cap
+    // without moving that subject on any other chain, or any other subject on its own.
+    #[tokio::test]
+    async fn chain_override_replaces_only_its_subject_on_its_chain() {
+        const GLOBAL_CAP: u128 = 1_000;
+        const CHAIN_CAP: u128 = 5_000;
+        const OTHER_SUB: &str = "other-capped";
+
+        let mut cfg = user_mode_cfg();
+        cfg.quota_overrides.insert(DEV_SUB.to_string(), GLOBAL_CAP);
+        cfg.quota_overrides.insert(OTHER_SUB.to_string(), GLOBAL_CAP);
+        let chain_block = ChainSponsorshipConfig {
+            quota_overrides: HashMap::from([(DEV_SUB.to_string(), CHAIN_CAP)]),
+            ..Default::default()
+        };
+        let chain_without_override = ChainSponsorshipConfig::default();
+        let storage = RelayStorage::in_memory();
+        let eval = SponsorshipEvaluator::new(
+            cfg,
+            HashMap::from([(CHAIN, chain_block), (OTHER_CHAIN, chain_without_override)]),
+            storage.clone(),
+        );
+        let calls = [call_to(TARGET)];
+
+        // Past the global cap, inside the chain's: sponsored, and the status agrees.
+        seed(&storage, DEV_SUB, CHAIN, U256::from(GLOBAL_CAP)).await;
+        assert!(eval.is_sponsored(EOA, Some(DEV_SUB), &calls, CHAIN).await.unwrap());
+        let status = eval.quota_status(None, Some(DEV_SUB), CHAIN).await.unwrap().unwrap();
+        assert_eq!(status.cap_wei, U256::from(CHAIN_CAP));
+
+        // At the chain's cap: refused.
+        seed(&storage, DEV_SUB, CHAIN, U256::from(CHAIN_CAP - GLOBAL_CAP)).await;
+        assert!(!eval.is_sponsored(EOA, Some(DEV_SUB), &calls, CHAIN).await.unwrap());
+
+        // A subject the chain does not name keeps the global entry there.
+        let status = eval.quota_status(None, Some(OTHER_SUB), CHAIN).await.unwrap().unwrap();
+        assert_eq!(status.cap_wei, U256::from(GLOBAL_CAP));
+
+        // Other chains keep the global entry, with or without a block of their own.
+        for chain in [OTHER_CHAIN, UNLISTED_CHAIN] {
+            let status = eval.quota_status(None, Some(DEV_SUB), chain).await.unwrap().unwrap();
+            assert_eq!(status.cap_wei, U256::from(GLOBAL_CAP));
+        }
+    }
+
+    /// Refuses `subject` and returns what was logged. A log site caches whether anyone is
+    /// listening when first used, and a test beside this one can finish doing that with no
+    /// subscriber installed, after ours went in. So rebuild the cache and try again for a
+    /// moment; a refusal that is not logged at this level still comes back empty.
+    async fn refusal_log(
+        eval: &SponsorshipEvaluator,
+        subject: &str,
+        captured: &Captured,
+    ) -> String {
+        for _ in 0..100 {
+            tracing::callsite::rebuild_interest_cache();
+            let calls = [call_to(TARGET)];
+            assert!(!eval.is_sponsored(EOA, Some(subject), &calls, CHAIN).await.unwrap());
+            let logged = captured.take();
+            if !logged.is_empty() {
+                return logged;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        String::new()
+    }
+
+    // An operator reading the default logs must be able to tell a spent quota from any
+    // other refusal, and which cap it hit. A real user's subject stays out of them.
+    #[tokio::test]
+    async fn quota_refusal_is_logged_with_cap_and_spend() {
+        let mut cfg = user_mode_cfg();
+        cfg.quota_overrides.insert(DEV_SUB.to_string(), 700);
+        let cap = cfg.per_user_wei;
+        let (eval, storage) = evaluator(cfg);
+        const REAL_SUB: &str = "someones-account-id";
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        seed(&storage, DEV_SUB, CHAIN, U256::from(900)).await;
+        let dev = refusal_log(&eval, DEV_SUB, &captured).await;
+        for field in ["subject=\"dev-local\"", "chain_id=84532", "cap=700", "spent=900"] {
+            assert!(dev.contains(field), "{field} missing from {dev}");
+        }
+
+        seed(&storage, REAL_SUB, CHAIN, cap).await;
+        let user = refusal_log(&eval, REAL_SUB, &captured).await;
+        assert!(user.contains("subject=\"user\""), "{user}");
+        assert!(user.contains(&format!("cap={cap}")), "{user}");
+        assert!(!user.contains(REAL_SUB), "{user}");
     }
 
     // The dev-hatch identity is NOT a gating bypass: a VerifiedSub(dev) request

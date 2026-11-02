@@ -1152,6 +1152,15 @@ mod tests {
         assert!(config.auth.is_some());
         // The boot refuses a set RELAY_DEV_API_KEY unless its subject is capped.
         assert!(config.sponsorship.quota_overrides.get("dev-local").is_some_and(|&wei| wei > 0));
+        // Caps are in each chain's native unit: 2 POL on Polygon, 0.002 ETH elsewhere.
+        for (id, cap) in [
+            (137u64, 2_000_000_000_000_000_000u128),
+            (8453, 2_000_000_000_000_000),
+            (4153, 2_000_000_000_000_000),
+        ] {
+            let cfg = config.sponsorship.resolve(id, &config.chain_sponsorship);
+            assert_eq!(cfg.quota_overrides.get("dev-local"), Some(&cap), "chain {id}");
+        }
         // Without this remap POL has no USD price and Polygon lists no fee token
         // but its native one (seen live on 2026-09-05).
         assert_eq!(

@@ -66,9 +66,9 @@ sponsorship:
   circuit_breaker_wei: "100000000000000000"
   # The dev hatch's one shared identity (auth.dev_api_key, env RELAY_DEV_API_KEY):
   # dev builds sign in against their own auth server, whose JWTs this relay
-  # cannot verify, so they send the static key instead. One cap for all of them,
-  # in each chain's own unit: 0.002 ETH a day on Base, Rise and Ethereum, and
-  # only 0.002 POL on Polygon, so a dev build pays its own gas there.
+  # cannot verify, so they send the static key instead. One cap for all of them:
+  # 0.002 ETH a day on Base, Rise and Ethereum. Caps are in the chain's own unit,
+  # so Polygon sets its own below.
   quota_overrides:
     dev-local: 2000000000000000
 
@@ -83,6 +83,9 @@ chain_sponsorship:
   137:
     per_user_wei: "20000000000000000000"
     circuit_breaker_wei: "1000000000000000000000"
+    # 2 POL a day for the dev hatch, about 20 intents.
+    quota_overrides:
+      dev-local: 2000000000000000000
     whitelisted_contracts:
       - "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" # USDC.e
       - "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" # USDC (Circle)
