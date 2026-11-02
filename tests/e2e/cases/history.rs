@@ -3,15 +3,21 @@ use crate::e2e::{
     eoa::{MockAccount, MockAccountBuilder},
     *,
 };
-use alloy::primitives::{Address, U256};
+use alloy::{
+    primitives::{Address, Bytes, U256},
+    providers::ext::AnvilApi,
+};
 use chrono::Utc;
 use eyre::Result;
 use relay::{
+    asset::AssetInfoService,
     rpc::{RelayApiClient, adjust_balance_for_decimals},
     storage::StorageApi,
+    transactions::asset_diffs::trace_logs,
     types::{
-        Call, DiffDirection, HistoricalPrice, IERC20,
+        Asset, AssetDiffs, Call, DiffDirection, HistoricalPrice, IERC20,
         rpc::{BundleId, CallHistoryEntry, GetCallsHistoryParameters, SortDirection},
+        simulation_assets::AssetDiffsBuilder,
     },
 };
 use std::time::Duration;
@@ -161,6 +167,89 @@ async fn send_bundle(
     }
 
     Ok(bundle_id)
+}
+
+/// Sends calls paying the fee in a token, and returns what was stored with what a trace shows.
+async fn stored_and_traced(
+    env: &Environment,
+    account: &MockAccount,
+    call: Call,
+) -> Result<(AssetDiffs, AssetDiffs)> {
+    let response = env
+        .relay_endpoint
+        .prepare_calls(PrepareCallsParameters {
+            calls: vec![call],
+            chain_id: env.chain_id(),
+            from: Some(account.address),
+            capabilities: PrepareCallsCapabilities {
+                meta: Meta { fee_token: Some(env.erc20), ..Default::default() },
+                ..Default::default()
+            },
+            key: Some(account.key.to_call_key()),
+            ..Default::default()
+        })
+        .await?;
+    let signature = account.key.sign_payload_hash(response.digest).await?;
+    let bundle_id = send_prepared_calls(env, &account.key, signature, response.context).await?;
+    let status = await_calls_status(env, bundle_id).await?;
+    assert!(status.status.is_confirmed());
+
+    let storage = &env.relay_handle.storage;
+    let tx_ids = storage.get_bundle_transactions(bundle_id).await?;
+    // why: diffs are written by a task spawned after confirmation.
+    let mut stored = None;
+    for _ in 0..100 {
+        stored = storage.read_asset_diffs(tx_ids.clone()).await?.into_iter().flatten().next();
+        if stored.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let service = AssetInfoService::new(16, &env.config);
+    let handle = service.handle();
+    tokio::spawn(service);
+    let logs = trace_logs(env.provider(), status.receipts[0].transaction_hash).await?;
+    let builder = AssetDiffsBuilder::from_logs(&logs);
+    let assets: Vec<Asset> = builder.seen_assets().copied().collect();
+    let metadata = handle.get_asset_info_list(env.provider(), assets).await?;
+
+    Ok((stored.expect("diffs were stored"), builder.build(metadata, Default::default())))
+}
+
+/// Every leg of the diffs, in an order that does not depend on how they were built.
+fn legs(diffs: &AssetDiffs) -> Vec<(Address, Option<Address>, DiffDirection, U256)> {
+    let mut legs: Vec<_> = diffs
+        .0
+        .iter()
+        .flat_map(|(account, assets)| {
+            assets.iter().map(|d| (*account, d.address, d.direction, d.value))
+        })
+        .collect();
+    legs.sort_by_key(|(account, asset, _, value)| (*account, *asset, *value));
+    legs
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_sends_store_what_a_trace_shows() -> Result<()> {
+    let env = Environment::setup().await?;
+    let account = MockAccountBuilder::new().build(&env).await?;
+    env.provider().anvil_set_balance(account.address, U256::from(10u64.pow(18))).await?;
+    let recipient = Address::random();
+
+    let token_send = Call::transfer(env.erc20, recipient, U256::from(5));
+    let (stored, traced) = stored_and_traced(&env, &account, token_send).await?;
+    assert_eq!(legs(&stored), legs(&traced));
+    assert!(legs(&stored).iter().any(|leg| leg.0 == recipient));
+
+    let value = U256::from(1234);
+    let native_send = Call { to: recipient, value, data: Bytes::new() };
+    let (stored, traced) = stored_and_traced(&env, &account, native_send).await?;
+    assert_eq!(legs(&stored), legs(&traced));
+    assert!(legs(&stored).contains(&(account.address, None, DiffDirection::Outgoing, value)));
+    assert!(legs(&stored).contains(&(recipient, None, DiffDirection::Incoming, value)));
+
+    Ok(())
 }
 
 /// Helper to fetch call history with given parameters

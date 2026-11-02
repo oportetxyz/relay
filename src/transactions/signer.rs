@@ -12,10 +12,14 @@ use crate::{
     error::StorageError,
     signers::DynSigner,
     storage::{LockLiquidityInput, RelayStorage, StorageApi},
-    transactions::{PullGasState, transaction::RelayTransactionKind},
+    transactions::{
+        PullGasState,
+        asset_diffs::{DIFF_RETRY_DELAYS, landed_asset_diffs},
+        transaction::RelayTransactionKind,
+    },
     transport::error::TransportErrExt,
     types::{
-        AssetDiffs, IFunder, ORCHESTRATOR_NO_ERROR,
+        IFunder, ORCHESTRATOR_NO_ERROR,
         OrchestratorContract::{self, IntentExecuted},
         SponsorshipUsage, generate_cast_call_command,
     },
@@ -348,12 +352,19 @@ impl Signer {
         tokio::spawn(async move {
             let tx_hash = receipt.transaction_hash;
             let tx_id = tx.id();
-            this.record_confirmed_metrics(tx, receipt).await;
+            let relay_tx = tx.tx.clone();
+            this.record_confirmed_metrics(tx, receipt.clone()).await;
 
-            let Ok(asset_diffs) =
-                AssetDiffs::from_trace_transaction(&this.provider, tx_hash, &this.asset_info).await
+            let Some(asset_diffs) = landed_asset_diffs(
+                &this.provider,
+                &this.asset_info,
+                &relay_tx,
+                &receipt,
+                this.chain_id,
+                &DIFF_RETRY_DELAYS,
+            )
+            .await
             else {
-                error!(?tx_hash, "Failed to extract asset diffs from transaction trace");
                 return;
             };
 

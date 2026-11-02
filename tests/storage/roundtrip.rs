@@ -226,6 +226,7 @@ impl Fixtures {
             sponsored_for: Some(Address::random()),
             sponsorship_hold: Some(B256::random()),
             max_fee_per_gas: Some(7),
+            bundle_id: Some(BundleId(B256::random())),
         };
 
         let pending_id = B256::with_last_byte(2);
