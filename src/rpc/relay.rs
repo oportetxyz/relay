@@ -981,6 +981,7 @@ impl Relay {
         let (quota_subject, sponsorship_hold) =
             sponsorship.filter(|_| quote.intent.total_payment_max_amount().is_zero()).unzip();
         let tx = RelayTransaction::new(quote, authorization_list, eip712_digest)
+            .with_bundle_id(bundle_id)
             .with_sponsorship_hold(sponsorship_hold)
             .with_quota_subject(quota_subject);
         self.inner.storage.add_bundle_tx(bundle_id, tx.id).await?;

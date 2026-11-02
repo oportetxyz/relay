@@ -62,6 +62,12 @@ pub struct AssetInfoServiceHandle {
 }
 
 impl AssetInfoServiceHandle {
+    /// Puts assets in the cache, so a test needs no chain for them.
+    #[cfg(test)]
+    pub(crate) fn seed(&self, chain_id: ChainId, assets: Vec<AssetWithInfo>) {
+        let _ = self.command_tx.send(AssetInfoServiceMessage::Update { chain_id, assets });
+    }
+
     /// Lookup asset info for a given chain and a list of assets. It first checks the cache, and if
     /// it cannot find it will query it from chain.
     ///

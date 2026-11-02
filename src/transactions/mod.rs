@@ -1,5 +1,6 @@
 //! Service responsible for broadcasting transactions.
 
+pub mod asset_diffs;
 mod service;
 pub use service::*;
 mod signer;

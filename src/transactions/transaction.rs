@@ -1,6 +1,9 @@
 use crate::{
     interop::EscrowDetails,
-    types::{IEscrow, QuotaSubject, Quote, SignedCalls, rpc::CallStatusCode},
+    types::{
+        IEscrow, QuotaSubject, Quote, SignedCalls,
+        rpc::{BundleId, CallStatusCode},
+    },
 };
 use alloy::{
     consensus::{Transaction, TxEip1559, TxEip7702, TxEnvelope, TypedTransaction},
@@ -109,6 +112,9 @@ pub struct RelayTransaction {
     /// Most an internal transaction may pay per gas. An intent has its quote's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fee_per_gas: Option<u128>,
+    /// Bundle this transaction belongs to. `None` for internal txs and older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<BundleId>,
 }
 
 impl RelayTransaction {
@@ -131,6 +137,7 @@ impl RelayTransaction {
             sponsored_for: None,
             sponsorship_hold: None,
             max_fee_per_gas: None,
+            bundle_id: None,
         }
     }
 
@@ -157,6 +164,12 @@ impl RelayTransaction {
     /// Set the most an internal tx may pay per gas.
     pub fn with_max_fee_per_gas(mut self, max_fee_per_gas: u128) -> Self {
         self.max_fee_per_gas = Some(max_fee_per_gas);
+        self
+    }
+
+    /// Set the bundle this tx belongs to.
+    pub fn with_bundle_id(mut self, bundle_id: BundleId) -> Self {
+        self.bundle_id = Some(bundle_id);
         self
     }
 
@@ -215,6 +228,7 @@ impl RelayTransaction {
             sponsored_for: None,
             sponsorship_hold: None,
             max_fee_per_gas: None,
+            bundle_id: None,
         }
     }
 
